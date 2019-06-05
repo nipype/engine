@@ -1,7 +1,9 @@
 from .. import auxiliary as aux
 
 import numpy as np
+import string
 import pytest, pdb
+from hypothesis import given, strategies as st
 
 
 class other_states_to_tests:
@@ -849,3 +851,65 @@ def test_groups_stack_input(group_for_inputs, groups_stack, groups_stack_input_e
     groups_stack_input = aux.groups_stack_input(group_for_inputs, groups_stack)
     for i, grs in enumerate(groups_stack_input):
         assert set(grs) == set(groups_stack_input_exp[i])
+
+
+splitter_h = st.recursive(
+    st.text(string.ascii_letters, min_size=1),
+    lambda substrat: st.lists(substrat, min_size=2, max_size=2)
+    | st.lists(substrat, min_size=2, max_size=2).map(tuple),
+)
+
+
+@given(splitter=splitter_h)
+def test_splits_groups_hypothesis(splitter):
+    print("Splitter from hypothesis", splitter)
+    splitter_rpn = aux.splitter2rpn(splitter)
+    try:
+        keys_f, groups_f, grstack_f, _ = aux._splits_groups(splitter_rpn)
+    # remove examples that have wrong shapes in scalar splitter
+    except ValueError as e:
+        if "do not have same shape" not in str(e):
+            raise
+    except Exception as e:
+        if "repeated in the splitter" not in str(e):
+            raise
+
+
+splitter_h = st.recursive(
+    st.text(string.ascii_letters, min_size=1),
+    lambda substrat: st.lists(substrat, min_size=2, max_size=2)
+    | st.lists(substrat, min_size=2, max_size=2).map(tuple),
+)
+
+
+@given(splitter=splitter_h)
+def test_splits_groups_comb_hypothesis(splitter):
+    splitter_rpn = aux.splitter2rpn(splitter)
+    if splitter_rpn:
+        combiner = [splitter_rpn[0]]
+    else:
+        combiner = []
+    print("Splitter from hypothesis", splitter, combiner)
+    try:
+        _, _, _, _ = aux._splits_groups(splitter_rpn, combiner)
+    # remove examples that have wrong shapes in scalar splitter
+    except ValueError as e:
+        if "do not have same shape" not in str(e):
+            raise
+    # remove examples that have the same field twice
+    except Exception as e:
+        if "repeated in the splitter" not in str(e):
+            raise
+
+
+splitter_h = st.recursive(
+    st.text(string.ascii_letters, min_size=1),
+    lambda substrat: st.lists(substrat, min_size=2, max_size=2)
+    | st.lists(substrat, min_size=2, max_size=2).map(tuple),
+)
+
+
+@given(splitter=splitter_h)
+def test_splitter_rpn_hypothesis(splitter):
+    rpn = aux.splitter2rpn(splitter)
+    assert aux.rpn2splitter(rpn) == splitter
