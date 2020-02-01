@@ -15,6 +15,7 @@ from .utils import (
 )
 from ..submitter import Submitter
 from ..core import Workflow
+from ...utils.messenger import AuditFlag, PrintMessenger, FileMessenger
 from ... import mark
 
 
@@ -1339,6 +1340,41 @@ def test_wfasnd_wfinp_1(plugin):
     assert results.output.out == 4
     # checking the output directory
     assert wf.output_dir.exists()
+
+
+@pytest.mark.parametrize("plugin", Plugins)
+@pytest.mark.parametrize("nr_proc", [1, 2, 4])
+def test_wfasnd_wfinp_2(plugin, nr_proc):
+    """ two workflows as nodes
+        takes the same input from the main wf
+        testing various numbers of processors
+    """
+    wf1 = Workflow(name="inner1", input_spec=["a"])
+    wf1.add(add2_wait(name="sleep", x=wf1.lzin.a))
+    wf1.set_output([("out", wf1.sleep.lzout.out)])
+    wf2 = Workflow(name="inner2", input_spec=["a"])
+    wf2.add(add2_wait(name="sleep", x=wf2.lzin.a))
+    wf2.set_output([("out", wf2.sleep.lzout.out)])
+
+    wf = Workflow(
+        name="outer",
+        input_spec=["a"],
+        audit_flags=AuditFlag.ALL,
+        messengers=PrintMessenger(),
+    )
+    wf.inputs.a = 4
+    wf.add(wf1)
+    wf.add(wf2)
+    wf1.inputs.a = wf.lzin.a
+    wf2.inputs.a = wf.lzin.a
+
+    wf.set_output([("out1", wf.inner1.lzout.out), ("out2", wf.inner2.lzout.out)])
+
+    with Submitter(plugin=plugin, nr_proc=nr_proc) as sub:
+        sub(wf)
+
+    assert wf.result().output.out1 == 6
+    assert wf.result().output.out2 == 6
 
 
 @pytest.mark.parametrize("plugin", Plugins)
