@@ -2,7 +2,13 @@
 import asyncio
 import time
 from uuid import uuid4
-from .workers import SerialWorker, ConcurrentFuturesWorker, SlurmWorker, DaskWorker
+from .workers import (
+    SerialWorker,
+    ConcurrentFuturesWorker,
+    SlurmWorker,
+    DaskWorker,
+    SGEWorker,
+)
 from .core import is_workflow
 from .helpers import get_open_loop, load_and_run_async
 
@@ -37,6 +43,8 @@ class Submitter:
             self.worker = SlurmWorker(**kwargs)
         elif self.plugin == "dask":
             self.worker = DaskWorker(**kwargs)
+        elif self.plugin == "sge":
+            self.worker = SGEWorker(**kwargs)
         else:
             raise Exception(f"plugin {self.plugin} not available")
         self.worker.loop = self.loop
@@ -163,6 +171,9 @@ class Submitter:
         task_futures = set()
         tasks, tasks_follow_errored = get_runnable_tasks(graph_copy)
         while tasks or task_futures or graph_copy.nodes:
+            print(f"tasks: {tasks}")
+            print(f"task_futures: {task_futures}")
+            print(f"graph_copy.nodes: {graph_copy.nodes}")
             if not tasks and not task_futures:
                 # it's possible that task_futures is empty, but not able to get any
                 # tasks from graph_copy (using get_runnable_tasks)
@@ -230,12 +241,14 @@ def get_runnable_tasks(graph):
         if set(graph.predecessors[tsk.name]).intersection(set(tasks)):
             break
         _is_runnable = is_runnable(graph, tsk)
+        print(f"_is_runnable: {_is_runnable}")
         if _is_runnable is True:
             tasks.append(tsk)
             to_remove.append(tsk)
         elif _is_runnable is False:
             continue
         else:  # a previous task had an error
+            print("A previous task had an error")
             errored_task = _is_runnable
             # removing all successors of the errored task
             for task_err in errored_task:
@@ -249,6 +262,7 @@ def get_runnable_tasks(graph):
     # removing tasks that are ready to run from the graph
     for nd in to_remove:
         graph.remove_nodes(nd)
+    print(f"Got runnable tasks: {tasks}")
     return tasks, following_err
 
 
@@ -258,11 +272,13 @@ def is_runnable(graph, obj):
     pred_errored = []
     is_done = None
     for pred in graph.predecessors[obj.name]:
+        print(f"pred: {pred}")
         try:
             is_done = pred.done
         except ValueError:
             pred_errored.append(pred)
 
+        # print(f"is_done: {is_done}")
         if is_done is True:
             connections_to_remove.append(pred)
         elif is_done is False:
