@@ -452,36 +452,51 @@ class SGEWorker(DistributedWorker):
 
         batchscript = script_dir / f"batchscript_{uid}.job"
 
-        self.tasks_to_run.append((task_pkl, ind, rerun))
+        self.tasks_to_run.append((str(task_pkl), ind, rerun))
 
         return script_dir, batchscript, task_pkl, ind
+
+    async def clear_tasks_to_run(self):
+        tasks_to_run_copy = self.tasks_to_run
+        self.tasks_to_run = []
+        return tasks_to_run_copy
 
     async def _submit_jobs(
         self, batchscript, name, uid, cache_dir, interpreter="/bin/sh"
     ):
+
         if len(self.tasks_to_run) <= 50:
             await asyncio.sleep(10)
 
-        if len(self.tasks_to_run) > 0:
-            python_string = f"""'from pydra.engine.helpers import load_and_run; import sys; task_pkls={str(self.tasks_to_run)}; load_and_run(task_pkl=task_pkls[sys.argv[1][0]], ind=task_pkls[sys.argv[1][1]], rerun=task_pkls[sys.argv[1][2]]) '
-            """
-            if self.write_output_files:
-                bcmd = "\n".join(
-                    (
-                        f"#!{interpreter}",
-                        f"#$ -o {str(script_dir)}",
-                        f"{sys.executable} -c " + python_string,
-                        f"$SGE_TASK_ID",
-                    )
+        tasks_to_run = await self.clear_tasks_to_run()
+
+        if len(tasks_to_run) > 0:
+            # python_string = f""""from pydra.engine.helpers import load_and_run
+            #  import sys
+            #  print('sge_task_id:')
+            #  print(sys.argv[1])
+            #  task_pkls={[task_tuple[0] for task_tuple in tasks_to_run]}
+            #  load_and_run(task_pkl=task_pkls[sys.argv[1][0]], ind=task_pkls[sys.argv[1][1]], rerun=task_pkls[sys.argv[1][2]]) \"
+            # """
+            python_string = f"""\"import sys; from pydra.engine.helpers import load_and_run; print(sys.argv[1]); task_pkls={[task_tuple for task_tuple in tasks_to_run]}; task_index=int(sys.argv[1])-1; print(task_pkls[task_index]); print(task_pkls[task_index][0]); print(task_pkls[task_index][1]); print(task_pkls[task_index][2]); load_and_run(task_pkl=task_pkls[task_index][0], ind=task_pkls[task_index][1], rerun=task_pkls[task_index][2])\""""
+            #  print(task_pkls[int(sys.argv[1])][0]); print(task_pkls[int(sys.argv[1])][1]); print(task_pkls[int(sys.argv[1])][2]);
+            # if self.write_output_files:
+            #     bcmd = "\n".join(
+            #         (
+            #             f"#!{interpreter}",
+            #             f"#$ -o {str(script_dir)}",
+            #             f"{sys.executable} -c " + python_string,
+            #             f"$SGE_TASK_ID",
+            #         )
+            #     )
+            # else:
+            bcmd = "\n".join(
+                (
+                    f"#!{interpreter}",
+                    f"{sys.executable} -c " + python_string + " $SGE_TASK_ID",
+                    # f"$SGE_TASK_ID",
                 )
-            else:
-                bcmd = "\n".join(
-                    (
-                        f"#!{interpreter}",
-                        f"{sys.executable} -c " + python_string,
-                        f"$SGE_TASK_ID",
-                    )
-                )
+            )
 
             with batchscript.open("wt") as fp:
                 fp.writelines(bcmd)
@@ -489,10 +504,9 @@ class SGEWorker(DistributedWorker):
             script_dir = cache_dir / f"{self.__class__.__name__}_scripts" / uid
             script_dir.mkdir(parents=True, exist_ok=True)
             sargs = ["-t"]
-            sargs.append(f"1-{len(self.tasks_to_run)}")
+            sargs.append(f"1-{len(tasks_to_run)}")
             sargs = sargs + self.qsub_args.split()
-            tasks_run = self.tasks_to_run
-            self.tasks_to_run = []
+
             jobname = re.search(r"(?<=-N )\S+", self.qsub_args)
 
             if not jobname:
@@ -527,7 +541,7 @@ class SGEWorker(DistributedWorker):
             jobid = jobid.group()
             self.output_by_jobid[jobid] = (rc, stdout, stderr)
 
-            for task_pkl, ind, rerun in tasks_run:
+            for task_pkl, ind, rerun in tasks_to_run:
                 self.jobid_by_task_pkl[task_pkl] = jobid
 
             if error_file:
@@ -574,24 +588,55 @@ class SGEWorker(DistributedWorker):
                     cmd_re = ("qmod", "-rj", jobid)
                     await read_and_display_async(*cmd_re, hide_display=True)
                 else:
+
+                    print("Returning Done is True")
+
                     return True
             # await asyncio.sleep(random.randint(1, 20))
             await asyncio.sleep(self.poll_delay)
 
     async def _poll_job(self, jobid, cache_dir, task_pkl, ind):
-        cmd = ("qstat", "-j", jobid)
+        # cmd = ("qstat", "-j", jobid)
+        # # print(f"jobs: {self._jobs}")
+        # logger.debug(f"Polling job {jobid}")
+
+        # rc, stdout, stderr = await read_and_display_async(*cmd, hide_display=True)
+
+        # if not stdout or "slurm_load_jobs error" in stderr:
+        #     # job is no longer running - check exit code
+        #     await asyncio.sleep(10)
+        #     status = await self._verify_exit_code(jobid)
+        #     return status
+        # # process.terminate()
+        # return False
+        task = load_task(task_pkl, ind=ind)
+        resultfile = task.output_dir / "_result.pklz"
+        print(f"Looking for result file in: {resultfile}")
         # print(f"jobs: {self._jobs}")
-        logger.debug(f"Polling job {jobid}")
-
-        rc, stdout, stderr = await read_and_display_async(*cmd, hide_display=True)
-
-        if not stdout or "slurm_load_jobs error" in stderr:
-            # job is no longer running - check exit code
-            await asyncio.sleep(10)
-            status = await self._verify_exit_code(jobid)
-            return status
-        # process.terminate()
-        return False
+        # print(f"resultfile: {resultfile}")
+        # print(f"jobid: {jobid}")
+        # print(f"jobname: {jobname}")
+        # print(f"script_dir: {script_dir}")
+        # print(f"uid: {uid}")
+        # print(f"script_dir: {script_dir}")
+        # resultfile = script_dir / Path("_result.pklz")
+        if resultfile.exists():
+            # print(f"cache_dir: {cache_dir}")
+            result = load_result(Path(task.output_dir.name), [cache_dir])
+            # print(f"result: {result}")
+            if result is not None:
+                # print(f"result.errored: {result.errored}")
+                if result.errored == False:
+                    return True
+                else:
+                    # status = await self._verify_exit_code(jobid)
+                    # # print(f"returning status: {status}")
+                    # return status
+                    return False
+            else:
+                return False
+        else:
+            return False
 
     async def _verify_exit_code(self, jobid):
         cmd = ("qacct", "-j", jobid)
