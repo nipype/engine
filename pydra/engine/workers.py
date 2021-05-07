@@ -15,6 +15,7 @@ from .helpers import (
     save,
     load_and_run,
     load_task,
+    load_result,
 )
 
 import logging
@@ -374,6 +375,7 @@ class SGEWorker(DistributedWorker):
         poll_delay=1,
         qsub_args=None,
         write_output_files=True,
+        max_job_array_length=50,
     ):
         """
         Initialize SLURM Worker.
@@ -400,7 +402,8 @@ class SGEWorker(DistributedWorker):
         self.tasks_to_run = []
         self.output_by_jobid = {}
         self.job_id_by_jobname = {}
-        self.jobid_by_task_pkl = {}
+        self.jobid_by_task_uid = {}
+        self.max_job_array_length = max_job_array_length
 
     def run_el(self, runnable, rerun=False):
         """Worker submission API."""
@@ -456,19 +459,22 @@ class SGEWorker(DistributedWorker):
 
         return script_dir, batchscript, task_pkl, ind
 
-    async def clear_tasks_to_run(self):
-        tasks_to_run_copy = self.tasks_to_run
-        self.tasks_to_run = []
+    async def get_tasks_to_run(self):
+        # Extract the first N tasks to run
+        tasks_to_run_copy, self.tasks_to_run = (
+            self.tasks_to_run[: self.max_job_array_length],
+            self.tasks_to_run[self.max_job_array_length :],
+        )
         return tasks_to_run_copy
 
     async def _submit_jobs(
         self, batchscript, name, uid, cache_dir, interpreter="/bin/sh"
     ):
 
-        if len(self.tasks_to_run) <= 50:
+        if len(self.tasks_to_run) <= self.max_job_array_length:
             await asyncio.sleep(10)
 
-        tasks_to_run = await self.clear_tasks_to_run()
+        tasks_to_run = await self.get_tasks_to_run()
 
         if len(tasks_to_run) > 0:
             # python_string = f""""from pydra.engine.helpers import load_and_run
@@ -478,7 +484,7 @@ class SGEWorker(DistributedWorker):
             #  task_pkls={[task_tuple[0] for task_tuple in tasks_to_run]}
             #  load_and_run(task_pkl=task_pkls[sys.argv[1][0]], ind=task_pkls[sys.argv[1][1]], rerun=task_pkls[sys.argv[1][2]]) \"
             # """
-            python_string = f"""\"import sys; from pydra.engine.helpers import load_and_run; print(sys.argv[1]); task_pkls={[task_tuple for task_tuple in tasks_to_run]}; task_index=int(sys.argv[1])-1; print(task_pkls[task_index]); print(task_pkls[task_index][0]); print(task_pkls[task_index][1]); print(task_pkls[task_index][2]); load_and_run(task_pkl=task_pkls[task_index][0], ind=task_pkls[task_index][1], rerun=task_pkls[task_index][2])\""""
+            python_string = f"""\"import sys; from pydra.engine.helpers import load_and_run; print(sys.argv[1]); task_pkls={[task_tuple for task_tuple in tasks_to_run]}; task_index=int(sys.argv[1])-1; load_and_run(task_pkl=task_pkls[task_index][0], ind=task_pkls[task_index][1], rerun=task_pkls[task_index][2])\""""
             #  print(task_pkls[int(sys.argv[1])][0]); print(task_pkls[int(sys.argv[1])][1]); print(task_pkls[int(sys.argv[1])][2]);
             # if self.write_output_files:
             #     bcmd = "\n".join(
@@ -542,19 +548,25 @@ class SGEWorker(DistributedWorker):
             self.output_by_jobid[jobid] = (rc, stdout, stderr)
 
             for task_pkl, ind, rerun in tasks_to_run:
-                self.jobid_by_task_pkl[task_pkl] = jobid
+                # print(
+                #     f"Adding {jobid} to jobid_by_task_uid by key {Path(task_pkl).parent.name}"
+                # )
+                self.jobid_by_task_uid[Path(task_pkl).parent.name] = jobid
 
             if error_file:
                 error_file = str(error_file).replace("%j", jobid)
             self.error[jobid] = str(error_file).replace("%j", jobid)
 
     async def get_output_by_task_pkl(self, task_pkl):
-        while self.jobid_by_task_pkl.get(task_pkl) == None:
+        jobid = self.jobid_by_task_uid.get(task_pkl.parent.name)
+        while jobid == None:
+            jobid = self.jobid_by_task_uid.get(task_pkl.parent.name)
             await asyncio.sleep(1)
-        jobid = self.jobid_by_task_pkl.get(task_pkl)
-        while self.output_by_jobid.get(jobid) == None:
+        job_output = self.output_by_jobid.get(jobid)
+        while job_output == None:
+            job_output = self.output_by_jobid.get(jobid)
             await asyncio.sleep(1)
-        return self.output_by_jobid[jobid]
+        return job_output
 
     async def _submit_job(self, batchscript, name, uid, cache_dir, task_pkl, ind):
 
@@ -562,8 +574,9 @@ class SGEWorker(DistributedWorker):
 
         await self._submit_jobs(batchscript, name, uid, cache_dir)
         jobname = ".".join((name, uid))
+        # print(f"jobname: {jobname}")
         rc, stdout, stderr = await self.get_output_by_task_pkl(task_pkl)
-        jobid = self.jobid_by_task_pkl.get(task_pkl)
+        jobid = self.jobid_by_task_uid.get(task_pkl.parent.name)
 
         # intermittent polling
         while True:
@@ -574,10 +587,7 @@ class SGEWorker(DistributedWorker):
             # done = await self._poll_job(jobid)
             done = await self._poll_job(jobid, cache_dir, task_pkl, ind)
             if done:
-                if (
-                    done in ["CANCELLED", "TIMEOUT", "PREEMPTED"]
-                    and "--no-requeue" not in self.qsub_args
-                ):
+                if done in ["ERRORED"] and "--no-requeue" not in self.qsub_args:
                     # loading info about task with a specific uid
                     info_file = cache_dir / f"{uid}_info.json"
                     if info_file.exists():
@@ -611,7 +621,7 @@ class SGEWorker(DistributedWorker):
         # return False
         task = load_task(task_pkl, ind=ind)
         resultfile = task.output_dir / "_result.pklz"
-        print(f"Looking for result file in: {resultfile}")
+        # print(f"Looking for result file in: {resultfile}")
         # print(f"jobs: {self._jobs}")
         # print(f"resultfile: {resultfile}")
         # print(f"jobid: {jobid}")
@@ -632,7 +642,7 @@ class SGEWorker(DistributedWorker):
                     # status = await self._verify_exit_code(jobid)
                     # # print(f"returning status: {status}")
                     # return status
-                    return False
+                    return "ERRORED"
             else:
                 return False
         else:
