@@ -399,7 +399,7 @@ class SGEWorker(DistributedWorker):
         self.write_output_files = (
             write_output_files  # avoid OSError: Too many open files
         )
-        self.tasks_to_run = []
+        self.tasks_to_run_by_threads_requested = {}
         self.output_by_jobid = {}
         self.job_id_by_jobname = {}
         self.jobid_by_task_uid = {}
@@ -455,15 +455,39 @@ class SGEWorker(DistributedWorker):
 
         batchscript = script_dir / f"batchscript_{uid}.job"
 
-        self.tasks_to_run.append((str(task_pkl), ind, rerun))
+        # Set the threads_requested if given in the task input_spec - otherwise set to 1
+        try:
+            print(f"task[-1]: {task[-1]}")
+            print(f"task[-1].inputs: {task[-1].inputs}")
+            print(f"Requested {task[-1].inputs.sgeThreads} threads")
+            threads_requested = task[-1].inputs.sgeThreads
+        except:
+            print(f"task: {task}")
+            try:
+                print(f"task.inputs: {task.inputs}")
+                threads_requested = task.inputs.sgeThreads
+            except:
+                print("can't get task.inputs")
+                print(f"Defaulting to 1 thread")
+                threads_requested = 1
+
+        if threads_requested not in self.tasks_to_run_by_threads_requested:
+            self.tasks_to_run_by_threads_requested[threads_requested] = []
+        self.tasks_to_run_by_threads_requested[threads_requested].append(
+            (str(task_pkl), ind, rerun)
+        )
 
         return script_dir, batchscript, task_pkl, ind
 
-    async def get_tasks_to_run(self):
+    async def get_tasks_to_run(self, threads_requested):
         # Extract the first N tasks to run
-        tasks_to_run_copy, self.tasks_to_run = (
-            self.tasks_to_run[: self.max_job_array_length],
-            self.tasks_to_run[self.max_job_array_length :],
+        tasks_to_run_copy, self.tasks_to_run_by_threads_requested[threads_requested] = (
+            self.tasks_to_run_by_threads_requested[threads_requested][
+                : self.max_job_array_length
+            ],
+            self.tasks_to_run_by_threads_requested[threads_requested][
+                self.max_job_array_length :
+            ],
         )
         return tasks_to_run_copy
 
@@ -471,91 +495,95 @@ class SGEWorker(DistributedWorker):
         self, batchscript, name, uid, cache_dir, interpreter="/bin/sh"
     ):
 
-        if len(self.tasks_to_run) <= self.max_job_array_length:
+        if len(self.tasks_to_run_by_threads_requested) <= self.max_job_array_length:
             await asyncio.sleep(10)
 
-        tasks_to_run = await self.get_tasks_to_run()
+        for threads_requested in self.tasks_to_run_by_threads_requested:
+            tasks_to_run = await self.get_tasks_to_run(threads_requested)
 
-        if len(tasks_to_run) > 0:
-            # python_string = f""""from pydra.engine.helpers import load_and_run
-            #  import sys
-            #  print('sge_task_id:')
-            #  print(sys.argv[1])
-            #  task_pkls={[task_tuple[0] for task_tuple in tasks_to_run]}
-            #  load_and_run(task_pkl=task_pkls[sys.argv[1][0]], ind=task_pkls[sys.argv[1][1]], rerun=task_pkls[sys.argv[1][2]]) \"
-            # """
-            python_string = f"""\"import sys; from pydra.engine.helpers import load_and_run; print(sys.argv[1]); task_pkls={[task_tuple for task_tuple in tasks_to_run]}; task_index=int(sys.argv[1])-1; load_and_run(task_pkl=task_pkls[task_index][0], ind=task_pkls[task_index][1], rerun=task_pkls[task_index][2])\""""
-            #  print(task_pkls[int(sys.argv[1])][0]); print(task_pkls[int(sys.argv[1])][1]); print(task_pkls[int(sys.argv[1])][2]);
-            # if self.write_output_files:
-            #     bcmd = "\n".join(
-            #         (
-            #             f"#!{interpreter}",
-            #             f"#$ -o {str(script_dir)}",
-            #             f"{sys.executable} -c " + python_string,
-            #             f"$SGE_TASK_ID",
-            #         )
-            #     )
-            # else:
-            bcmd = "\n".join(
-                (
-                    f"#!{interpreter}",
-                    f"{sys.executable} -c " + python_string + " $SGE_TASK_ID",
-                    # f"$SGE_TASK_ID",
+            if len(tasks_to_run) > 0:
+                # python_string = f""""from pydra.engine.helpers import load_and_run
+                #  import sys
+                #  print('sge_task_id:')
+                #  print(sys.argv[1])
+                #  task_pkls={[task_tuple[0] for task_tuple in tasks_to_run]}
+                #  load_and_run(task_pkl=task_pkls[sys.argv[1][0]], ind=task_pkls[sys.argv[1][1]], rerun=task_pkls[sys.argv[1][2]]) \"
+                # """
+                python_string = f"""\"import sys; from pydra.engine.helpers import load_and_run; print(sys.argv[1]); task_pkls={[task_tuple for task_tuple in tasks_to_run]}; task_index=int(sys.argv[1])-1; load_and_run(task_pkl=task_pkls[task_index][0], ind=task_pkls[task_index][1], rerun=task_pkls[task_index][2])\""""
+                #  print(task_pkls[int(sys.argv[1])][0]); print(task_pkls[int(sys.argv[1])][1]); print(task_pkls[int(sys.argv[1])][2]);
+                # if self.write_output_files:
+                #     bcmd = "\n".join(
+                #         (
+                #             f"#!{interpreter}",
+                #             f"#$ -o {str(script_dir)}",
+                #             f"{sys.executable} -c " + python_string,
+                #             f"$SGE_TASK_ID",
+                #         )
+                #     )
+                # else:
+                bcmd = "\n".join(
+                    (
+                        f"#!{interpreter}",
+                        f"{sys.executable} -c " + python_string + " $SGE_TASK_ID",
+                        # f"$SGE_TASK_ID",
+                    )
                 )
-            )
 
-            with batchscript.open("wt") as fp:
-                fp.writelines(bcmd)
+                with batchscript.open("wt") as fp:
+                    fp.writelines(bcmd)
 
-            script_dir = cache_dir / f"{self.__class__.__name__}_scripts" / uid
-            script_dir.mkdir(parents=True, exist_ok=True)
-            sargs = ["-t"]
-            sargs.append(f"1-{len(tasks_to_run)}")
-            sargs = sargs + self.qsub_args.split()
+                script_dir = cache_dir / f"{self.__class__.__name__}_scripts" / uid
+                script_dir.mkdir(parents=True, exist_ok=True)
+                sargs = ["-t"]
+                sargs.append(f"1-{len(tasks_to_run)}")
+                sargs = sargs + self.qsub_args.split()
 
-            jobname = re.search(r"(?<=-N )\S+", self.qsub_args)
+                jobname = re.search(r"(?<=-N )\S+", self.qsub_args)
 
-            if not jobname:
-                jobname = ".".join((name, uid))
-                sargs.append("-N")
-                sargs.append(jobname)
-            output = re.search(r"(?<=-o )\S+", self.qsub_args)
-            # print(f"output: {output}")
-            if not output:
-                output_file = str(script_dir / "sge-%j.out")
-                if self.write_output_files:
-                    sargs.append("-o")
-                    sargs.append(output_file)
-            error = re.search(r"(?<=-e )\S+", self.qsub_args)
-            if not error:
-                error_file = str(script_dir / "sge-%j.out")
-                if self.write_output_files:
-                    sargs.append("-e")
-                    sargs.append(error_file)
-            else:
-                error_file = None
-            sargs.append(str(batchscript))
+                if not jobname:
+                    jobname = ".".join((name, uid))
+                    sargs.append("-N")
+                    sargs.append(jobname)
+                output = re.search(r"(?<=-o )\S+", self.qsub_args)
+                # print(f"output: {output}")
+                sargs.append("-pe")
+                sargs.append("smp")
+                sargs.append(f"{threads_requested}")
+                if not output:
+                    output_file = str(script_dir / "sge-%j.out")
+                    if self.write_output_files:
+                        sargs.append("-o")
+                        sargs.append(output_file)
+                error = re.search(r"(?<=-e )\S+", self.qsub_args)
+                if not error:
+                    error_file = str(script_dir / "sge-%j.out")
+                    if self.write_output_files:
+                        sargs.append("-e")
+                        sargs.append(error_file)
+                else:
+                    error_file = None
+                sargs.append(str(batchscript))
 
-            rc, stdout, stderr = await read_and_display_async(
-                "qsub", *sargs, hide_display=True
-            )
-            jobid = re.search(r"\d+", stdout)
-            if rc:
-                raise RuntimeError(f"Error returned from qsub: {stderr}")
-            elif not jobid:
-                raise RuntimeError("Could not extract job ID")
-            jobid = jobid.group()
-            self.output_by_jobid[jobid] = (rc, stdout, stderr)
+                rc, stdout, stderr = await read_and_display_async(
+                    "qsub", *sargs, hide_display=True
+                )
+                jobid = re.search(r"\d+", stdout)
+                if rc:
+                    raise RuntimeError(f"Error returned from qsub: {stderr}")
+                elif not jobid:
+                    raise RuntimeError("Could not extract job ID")
+                jobid = jobid.group()
+                self.output_by_jobid[jobid] = (rc, stdout, stderr)
 
-            for task_pkl, ind, rerun in tasks_to_run:
-                # print(
-                #     f"Adding {jobid} to jobid_by_task_uid by key {Path(task_pkl).parent.name}"
-                # )
-                self.jobid_by_task_uid[Path(task_pkl).parent.name] = jobid
+                for task_pkl, ind, rerun in tasks_to_run:
+                    # print(
+                    #     f"Adding {jobid} to jobid_by_task_uid by key {Path(task_pkl).parent.name}"
+                    # )
+                    self.jobid_by_task_uid[Path(task_pkl).parent.name] = jobid
 
-            if error_file:
-                error_file = str(error_file).replace("%j", jobid)
-            self.error[jobid] = str(error_file).replace("%j", jobid)
+                if error_file:
+                    error_file = str(error_file).replace("%j", jobid)
+                self.error[jobid] = str(error_file).replace("%j", jobid)
 
     async def get_output_by_task_pkl(self, task_pkl):
         jobid = self.jobid_by_task_uid.get(task_pkl.parent.name)
