@@ -103,6 +103,10 @@ class DistributedWorker(Worker):
             logger.warning(f"Reducing queued jobs due to max jobs ({self.max_jobs})")
             futures = list(futures)
             futures, unqueued = set(futures[:job_slots]), set(futures[job_slots:])
+            print(f"jobs: {self._jobs}")
+            print(f"futures: {futures}")
+            print(f"unqueued: {unqueued}")
+            await asyncio.sleep(10)
         try:
             self._jobs += len(futures)
             done, pending = await asyncio.wait(
@@ -404,6 +408,9 @@ class SGEWorker(DistributedWorker):
         self.job_id_by_jobname = {}
         self.jobid_by_task_uid = {}
         self.max_job_array_length = max_job_array_length
+        self.threads_used = 0
+        self.max_threads = 500
+        self.job_completed_by_jobid = {}
 
     def run_el(self, runnable, rerun=False):
         """Worker submission API."""
@@ -457,18 +464,11 @@ class SGEWorker(DistributedWorker):
 
         # Set the threads_requested if given in the task input_spec - otherwise set to 1
         try:
-            print(f"task[-1]: {task[-1]}")
-            print(f"task[-1].inputs: {task[-1].inputs}")
-            print(f"Requested {task[-1].inputs.sgeThreads} threads")
             threads_requested = task[-1].inputs.sgeThreads
         except:
-            print(f"task: {task}")
             try:
-                print(f"task.inputs: {task.inputs}")
                 threads_requested = task.inputs.sgeThreads
             except:
-                print("can't get task.inputs")
-                print(f"Defaulting to 1 thread")
                 threads_requested = 1
 
         if threads_requested not in self.tasks_to_run_by_threads_requested:
@@ -498,8 +498,11 @@ class SGEWorker(DistributedWorker):
         if len(self.tasks_to_run_by_threads_requested) <= self.max_job_array_length:
             await asyncio.sleep(10)
 
+        # while self.threads_used >
+
         for threads_requested in self.tasks_to_run_by_threads_requested:
             tasks_to_run = await self.get_tasks_to_run(threads_requested)
+            # self.threads_used += len(tasks_to_run)
 
             if len(tasks_to_run) > 0:
                 # python_string = f""""from pydra.engine.helpers import load_and_run
@@ -585,6 +588,31 @@ class SGEWorker(DistributedWorker):
                     error_file = str(error_file).replace("%j", jobid)
                 self.error[jobid] = str(error_file).replace("%j", jobid)
 
+                while True:
+                    # 3 possibilities
+                    # False: job is still pending/working
+                    # True: job is complete
+                    # Exception: Polling / job failure
+                    # done = await self._poll_job(jobid)
+                    done = await self._poll_job(jobid, cache_dir, task_pkl, ind)
+                    print(f"self.job_completed_by_jobid: {self.job_completed_by_jobid}")
+                    if done:
+                        if done in ["ERRORED"] and "--no-requeue" not in self.qsub_args:
+                            # loading info about task with a specific uid
+                            info_file = cache_dir / f"{uid}_info.json"
+                            if info_file.exists():
+                                checksum = json.loads(info_file.read_text())["checksum"]
+                                if (cache_dir / f"{checksum}.lock").exists():
+                                    # for pyt3.8 we could you missing_ok=True
+                                    (cache_dir / f"{checksum}.lock").unlink()
+                            cmd_re = ("qmod", "-rj", jobid)
+                            await read_and_display_async(*cmd_re, hide_display=True)
+                        else:
+                            # return True
+                            self.job_completed_by_jobid[jobid] = True
+                            return True
+                    await asyncio.sleep(self.poll_delay)
+
     async def get_output_by_task_pkl(self, task_pkl):
         jobid = self.jobid_by_task_uid.get(task_pkl.parent.name)
         while jobid == None:
@@ -606,75 +634,81 @@ class SGEWorker(DistributedWorker):
         rc, stdout, stderr = await self.get_output_by_task_pkl(task_pkl)
         jobid = self.jobid_by_task_uid.get(task_pkl.parent.name)
 
-        # intermittent polling
         while True:
-            # 3 possibilities
-            # False: job is still pending/working
-            # True: job is complete
-            # Exception: Polling / job failure
-            # done = await self._poll_job(jobid)
-            done = await self._poll_job(jobid, cache_dir, task_pkl, ind)
-            if done:
-                if done in ["ERRORED"] and "--no-requeue" not in self.qsub_args:
-                    # loading info about task with a specific uid
-                    info_file = cache_dir / f"{uid}_info.json"
-                    if info_file.exists():
-                        checksum = json.loads(info_file.read_text())["checksum"]
-                        if (cache_dir / f"{checksum}.lock").exists():
-                            # for pyt3.8 we could you missing_ok=True
-                            (cache_dir / f"{checksum}.lock").unlink()
-                    cmd_re = ("qmod", "-rj", jobid)
-                    await read_and_display_async(*cmd_re, hide_display=True)
-                else:
+            if self.job_completed_by_jobid.get(jobid) == True:
+                return True
+            else:
+                await asyncio.sleep(self.poll_delay)
 
-                    print("Returning Done is True")
-
-                    return True
-            # await asyncio.sleep(random.randint(1, 20))
-            await asyncio.sleep(self.poll_delay)
+        # intermittent polling
+        # while True:
+        #     # 3 possibilities
+        #     # False: job is still pending/working
+        #     # True: job is complete
+        #     # Exception: Polling / job failure
+        #     # done = await self._poll_job(jobid)
+        #     done = await self._poll_job(jobid, cache_dir, task_pkl, ind)
+        #     if done:
+        #         if done in ["ERRORED"] and "--no-requeue" not in self.qsub_args:
+        #             # loading info about task with a specific uid
+        #             info_file = cache_dir / f"{uid}_info.json"
+        #             if info_file.exists():
+        #                 checksum = json.loads(info_file.read_text())["checksum"]
+        #                 if (cache_dir / f"{checksum}.lock").exists():
+        #                     # for pyt3.8 we could you missing_ok=True
+        #                     (cache_dir / f"{checksum}.lock").unlink()
+        #             cmd_re = ("qmod", "-rj", jobid)
+        #             await read_and_display_async(*cmd_re, hide_display=True)
+        #         else:
+        #             return True
+        #     # await asyncio.sleep(random.randint(1, 20))
+        #     # await asyncio.sleep(self.poll_delay)
+        #     # await asyncio.sleep(random.uniform(0, self.poll_delay))
+        #     await asyncio.sleep(self.poll_delay)
 
     async def _poll_job(self, jobid, cache_dir, task_pkl, ind):
-        # cmd = ("qstat", "-j", jobid)
-        # # print(f"jobs: {self._jobs}")
-        # logger.debug(f"Polling job {jobid}")
-
-        # rc, stdout, stderr = await read_and_display_async(*cmd, hide_display=True)
-
-        # if not stdout or "slurm_load_jobs error" in stderr:
-        #     # job is no longer running - check exit code
-        #     await asyncio.sleep(10)
-        #     status = await self._verify_exit_code(jobid)
-        #     return status
-        # # process.terminate()
-        # return False
-        task = load_task(task_pkl, ind=ind)
-        resultfile = task.output_dir / "_result.pklz"
-        # print(f"Looking for result file in: {resultfile}")
+        cmd = ("qstat", "-j", jobid)
         # print(f"jobs: {self._jobs}")
-        # print(f"resultfile: {resultfile}")
-        # print(f"jobid: {jobid}")
-        # print(f"jobname: {jobname}")
-        # print(f"script_dir: {script_dir}")
-        # print(f"uid: {uid}")
-        # print(f"script_dir: {script_dir}")
-        # resultfile = script_dir / Path("_result.pklz")
-        if resultfile.exists():
-            # print(f"cache_dir: {cache_dir}")
-            result = load_result(Path(task.output_dir.name), [cache_dir])
-            # print(f"result: {result}")
-            if result is not None:
-                # print(f"result.errored: {result.errored}")
-                if result.errored == False:
-                    return True
-                else:
-                    # status = await self._verify_exit_code(jobid)
-                    # # print(f"returning status: {status}")
-                    # return status
-                    return "ERRORED"
-            else:
-                return False
-        else:
-            return False
+        logger.debug(f"Polling job {jobid}")
+
+        rc, stdout, stderr = await read_and_display_async(*cmd, hide_display=True)
+
+        if not stdout or "slurm_load_jobs error" in stderr:
+            # job is no longer running - check exit code
+            # await asyncio.sleep(10)
+            status = await self._verify_exit_code(jobid)
+            return status
+        # process.terminate()
+        return False
+        # task = load_task(task_pkl, ind=ind)
+        # resultfile = task.output_dir / "_result.pklz"
+        # # print(f"Looking for result file in: {resultfile}")
+        # # print(f"jobs: {self._jobs}")
+        # # print(f"resultfile: {resultfile}")
+        # # print(f"jobid: {jobid}")
+        # # print(f"jobname: {jobname}")
+        # # print(f"script_dir: {script_dir}")
+        # # print(f"uid: {uid}")
+        # # print(f"script_dir: {script_dir}")
+        # # resultfile = script_dir / Path("_result.pklz")
+        # print(f"Checking for job completion: {resultfile}")
+        # if resultfile.exists():
+        #     # print(f"cache_dir: {cache_dir}")
+        #     result = load_result(Path(task.output_dir.name), [cache_dir])
+        #     # print(f"result: {result}")
+        #     if result is not None:
+        #         # print(f"result.errored: {result.errored}")
+        #         if result.errored == False:
+        #             return True
+        #         else:
+        #             # status = await self._verify_exit_code(jobid)
+        #             # # print(f"returning status: {status}")
+        #             # return status
+        #             return "ERRORED"
+        #     else:
+        #         return False
+        # else:
+        #     return False
 
     async def _verify_exit_code(self, jobid):
         cmd = ("qacct", "-j", jobid)
