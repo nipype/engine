@@ -4,7 +4,7 @@ import sys, os, json
 import re
 from tempfile import gettempdir
 from pathlib import Path
-from shutil import copyfile
+from shutil import copyfile, which
 
 import concurrent.futures as cf
 
@@ -380,6 +380,8 @@ class SGEWorker(DistributedWorker):
         qsub_args=None,
         write_output_files=True,
         max_job_array_length=50,
+        indirect_submit_host=None,
+        max_threads=None,
     ):
         """
         Initialize SLURM Worker.
@@ -409,8 +411,18 @@ class SGEWorker(DistributedWorker):
         self.jobid_by_task_uid = {}
         self.max_job_array_length = max_job_array_length
         self.threads_used = 0
-        self.max_threads = 500
+        # self.max_threads = 500
         self.job_completed_by_jobid = {}
+        self.indirect_submit_host = indirect_submit_host
+        self.sge_bin = Path(which("qsub")).parent
+        self.indirect_submit_host_prefix = []
+        if indirect_submit_host is not None:
+            self.indirect_submit_host_prefix = []
+            self.indirect_submit_host_prefix.append("ssh")
+            self.indirect_submit_host_prefix.append(self.indirect_submit_host)
+            self.indirect_submit_host_prefix.append('""export SGE_ROOT=/opt/sge;')
+        self.event_loop = asyncio.new_event_loop()
+        self.max_threads = max_threads
 
     def run_el(self, runnable, rerun=False):
         """Worker submission API."""
@@ -498,11 +510,16 @@ class SGEWorker(DistributedWorker):
         if len(self.tasks_to_run_by_threads_requested) <= self.max_job_array_length:
             await asyncio.sleep(10)
 
-        # while self.threads_used >
-
         for threads_requested in self.tasks_to_run_by_threads_requested:
             tasks_to_run = await self.get_tasks_to_run(threads_requested)
             # self.threads_used += len(tasks_to_run)
+
+            if self.max_threads is not None:
+                while self.threads_used >= self.max_threads - threads_requested * len(
+                    tasks_to_run
+                ):
+                    await asyncio.sleep(10)
+            self.threads_used += threads_requested * len(tasks_to_run)
 
             if len(tasks_to_run) > 0:
                 # python_string = f""""from pydra.engine.helpers import load_and_run
@@ -567,9 +584,22 @@ class SGEWorker(DistributedWorker):
                     error_file = None
                 sargs.append(str(batchscript))
 
-                rc, stdout, stderr = await read_and_display_async(
-                    "qsub", *sargs, hide_display=True
-                )
+                if self.indirect_submit_host is not None:
+                    # submit_host = []
+                    # submit_host.append("ssh")
+                    # submit_host.append(self.indirect_submit_host)
+                    # submit_host.append('""export SGE_ROOT=/opt/sge;')
+                    rc, stdout, stderr = await read_and_display_async(
+                        *self.indirect_submit_host_prefix,
+                        str(self.sge_bin / "qsub"),
+                        *sargs,
+                        '""',
+                        hide_display=True,
+                    )
+                else:
+                    rc, stdout, stderr = await read_and_display_async(
+                        "qsub", *sargs, hide_display=True
+                    )
                 jobid = re.search(r"\d+", stdout)
                 if rc:
                     raise RuntimeError(f"Error returned from qsub: {stderr}")
@@ -605,11 +635,21 @@ class SGEWorker(DistributedWorker):
                                 if (cache_dir / f"{checksum}.lock").exists():
                                     # for pyt3.8 we could you missing_ok=True
                                     (cache_dir / f"{checksum}.lock").unlink()
-                            cmd_re = ("qmod", "-rj", jobid)
+                            if self.indirect_submit_host is not None:
+                                cmd_re = (
+                                    "ssh",
+                                    self.indirect_submit_host,
+                                    f"qmod",
+                                    "-rj",
+                                    jobid,
+                                )
+                            else:
+                                cmd_re = (f"qmod", "-rj", jobid)
                             await read_and_display_async(*cmd_re, hide_display=True)
                         else:
                             # return True
                             self.job_completed_by_jobid[jobid] = True
+                            self.threads_used -= threads_requested * len(tasks_to_run)
                             return True
                     await asyncio.sleep(self.poll_delay)
 
@@ -636,6 +676,7 @@ class SGEWorker(DistributedWorker):
 
         while True:
             if self.job_completed_by_jobid.get(jobid) == True:
+                print("Returning true in _submit_job")
                 return True
             else:
                 await asyncio.sleep(self.poll_delay)
@@ -667,7 +708,7 @@ class SGEWorker(DistributedWorker):
         #     await asyncio.sleep(self.poll_delay)
 
     async def _poll_job(self, jobid, cache_dir, task_pkl, ind):
-        cmd = ("qstat", "-j", jobid)
+        cmd = (f"qstat", "-j", jobid)
         # print(f"jobs: {self._jobs}")
         logger.debug(f"Polling job {jobid}")
 
@@ -711,7 +752,7 @@ class SGEWorker(DistributedWorker):
         #     return False
 
     async def _verify_exit_code(self, jobid):
-        cmd = ("qacct", "-j", jobid)
+        cmd = (f"qacct", "-j", jobid)
         # print(psutil.Process(os.getpid()).as_dict()["num_fds"])
         rc, stdout, stderr = await read_and_display_async(*cmd, hide_display=True)
 
