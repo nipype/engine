@@ -382,6 +382,7 @@ class SGEWorker(DistributedWorker):
         max_job_array_length=50,
         indirect_submit_host=None,
         max_threads=None,
+        default_threads_per_task=None,
     ):
         """
         Initialize SLURM Worker.
@@ -423,6 +424,7 @@ class SGEWorker(DistributedWorker):
             self.indirect_submit_host_prefix.append('""export SGE_ROOT=/opt/sge;')
         self.event_loop = asyncio.new_event_loop()
         self.max_threads = max_threads
+        self.default_threads_per_task = default_threads_per_task
 
     def run_el(self, runnable, rerun=False):
         """Worker submission API."""
@@ -481,7 +483,7 @@ class SGEWorker(DistributedWorker):
             try:
                 threads_requested = task.inputs.sgeThreads
             except:
-                threads_requested = 1
+                threads_requested = self.default_threads_per_task
 
         if threads_requested not in self.tasks_to_run_by_threads_requested:
             self.tasks_to_run_by_threads_requested[threads_requested] = []
@@ -503,6 +505,24 @@ class SGEWorker(DistributedWorker):
         )
         return tasks_to_run_copy
 
+    async def count_threads_used(self):
+        counted_threads_used = 0
+        cmd = []
+        cmd.append("qstat")
+        cmd.append("-f")
+        cmd.append("-q")
+        cmd.append("HJ")
+        cmd.append("|")
+        cmd.append("grep")
+        cmd.append("-P")
+        cmd.append("'[0-9]{7}'|wc")
+        cmd.append("-l")
+        stdout = await read_and_display_async(
+            *cmd,
+            hide_display=True,
+        )
+        print(f"counted threads used: {stdout}")
+
     async def _submit_jobs(
         self, batchscript, name, uid, cache_dir, interpreter="/bin/sh"
     ):
@@ -513,15 +533,18 @@ class SGEWorker(DistributedWorker):
         for threads_requested in self.tasks_to_run_by_threads_requested:
             tasks_to_run = await self.get_tasks_to_run(threads_requested)
             # self.threads_used += len(tasks_to_run)
+            print(f"self.threads_used: {self.threads_used}")
 
-            if self.max_threads is not None:
-                while self.threads_used >= self.max_threads - threads_requested * len(
-                    tasks_to_run
-                ):
-                    await asyncio.sleep(10)
-            self.threads_used += threads_requested * len(tasks_to_run)
-
+            # print(f"self.threads_used: {self.threads_used}")
+            # await self.count_threads_used()
             if len(tasks_to_run) > 0:
+                if self.max_threads is not None:
+                    while (
+                        self.threads_used
+                        > self.max_threads - threads_requested * len(tasks_to_run)
+                    ):
+                        await asyncio.sleep(10)
+                self.threads_used += threads_requested * len(tasks_to_run)
                 # python_string = f""""from pydra.engine.helpers import load_and_run
                 #  import sys
                 #  print('sge_task_id:')
@@ -584,6 +607,7 @@ class SGEWorker(DistributedWorker):
                     error_file = None
                 sargs.append(str(batchscript))
 
+                await asyncio.sleep(random.uniform(0, 5))
                 if self.indirect_submit_host is not None:
                     # submit_host = []
                     # submit_host.append("ssh")
@@ -645,13 +669,17 @@ class SGEWorker(DistributedWorker):
                                 )
                             else:
                                 cmd_re = (f"qmod", "-rj", jobid)
+                            print("Requeuing")
                             await read_and_display_async(*cmd_re, hide_display=True)
                         else:
                             # return True
                             self.job_completed_by_jobid[jobid] = True
                             self.threads_used -= threads_requested * len(tasks_to_run)
                             return True
-                    await asyncio.sleep(self.poll_delay)
+                    # Don't poll exactly on the same interval to avoid overloading SGE
+                    await asyncio.sleep(
+                        random.uniform(max(0, self.poll_delay - 2), self.poll_delay + 2)
+                    )
 
     async def get_output_by_task_pkl(self, task_pkl):
         jobid = self.jobid_by_task_uid.get(task_pkl.parent.name)
@@ -711,7 +739,6 @@ class SGEWorker(DistributedWorker):
         cmd = (f"qstat", "-j", jobid)
         # print(f"jobs: {self._jobs}")
         logger.debug(f"Polling job {jobid}")
-
         rc, stdout, stderr = await read_and_display_async(*cmd, hide_display=True)
 
         if not stdout or "slurm_load_jobs error" in stderr:
@@ -774,13 +801,14 @@ class SGEWorker(DistributedWorker):
             raise RuntimeError("Job information not found")
         m = self._sacct_re.search(stdout)
         error_file = self.error[jobid]
-        if int(stdout_dict["failed"]) == 0:
+        if [int(s) for s in stdout_dict["failed"].split() if s.isdigit()][0] == 0:
             # process.terminate()
             # print("Returning True because stdout_dict failed is 0")
             return True
         else:
-            error_message = "Job failed (unknown reason - TODO)"
-            raise Exception(error_message)
+            # error_message = "Job failed (unknown reason - TODO)"
+            # raise Exception(error_message)
+            return "ERRORED"
         # print("Returning True - reached end")
         return True
 
