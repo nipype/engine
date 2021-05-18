@@ -382,7 +382,7 @@ class SGEWorker(DistributedWorker):
         max_job_array_length=50,
         indirect_submit_host=None,
         max_threads=None,
-        default_threads_per_task=None,
+        default_threads_per_task=1,
     ):
         """
         Initialize SLURM Worker.
@@ -428,9 +428,13 @@ class SGEWorker(DistributedWorker):
 
     def run_el(self, runnable, rerun=False):
         """Worker submission API."""
-        script_dir, batch_script, task_pkl, ind = self._prepare_runscripts(
-            runnable, rerun=rerun
-        )
+        (
+            script_dir,
+            batch_script,
+            task_pkl,
+            ind,
+            threads_requested,
+        ) = self._prepare_runscripts(runnable, rerun=rerun)
         if (script_dir / script_dir.parts[1]) == gettempdir():
             logger.warning("Temporary directories may not be shared across computers")
         if isinstance(runnable, TaskBase):
@@ -449,6 +453,7 @@ class SGEWorker(DistributedWorker):
             cache_dir=cache_dir,
             task_pkl=task_pkl,
             ind=ind,
+            threads_requested=threads_requested,
         )
 
     def _prepare_runscripts(self, task, interpreter="/bin/sh", rerun=False):
@@ -491,6 +496,8 @@ class SGEWorker(DistributedWorker):
                         threads_requested = task.inputs.num_threads
                     except:
                         threads_requested = self.default_threads_per_task
+        if threads_requested == None:
+            threads_requested = self.default_threads_per_task
 
         if threads_requested not in self.tasks_to_run_by_threads_requested:
             self.tasks_to_run_by_threads_requested[threads_requested] = []
@@ -498,7 +505,7 @@ class SGEWorker(DistributedWorker):
             (str(task_pkl), ind, rerun)
         )
 
-        return script_dir, batchscript, task_pkl, ind
+        return script_dir, batchscript, task_pkl, ind, threads_requested
 
     async def get_tasks_to_run(self, threads_requested):
         # Extract the first N tasks to run
@@ -531,174 +538,186 @@ class SGEWorker(DistributedWorker):
         print(f"counted threads used: {stdout}")
 
     async def _submit_jobs(
-        self, batchscript, name, uid, cache_dir, interpreter="/bin/sh"
+        self,
+        batchscript,
+        name,
+        uid,
+        cache_dir,
+        threads_requested,
+        interpreter="/bin/sh",
     ):
+        # for threads_requested in self.tasks_to_run_by_threads_requested:
 
-        if len(self.tasks_to_run_by_threads_requested) <= self.max_job_array_length:
+        if (
+            len(self.tasks_to_run_by_threads_requested.get(threads_requested))
+            <= self.max_job_array_length
+        ):
             await asyncio.sleep(10)
+        tasks_to_run = await self.get_tasks_to_run(threads_requested)
+        # self.threads_used += len(tasks_to_run)
+        print(f"self.threads_used: {self.threads_used}")
 
-        for threads_requested in self.tasks_to_run_by_threads_requested:
-            tasks_to_run = await self.get_tasks_to_run(threads_requested)
-            # self.threads_used += len(tasks_to_run)
-            print(f"self.threads_used: {self.threads_used}")
-
-            # print(f"self.threads_used: {self.threads_used}")
-            # await self.count_threads_used()
-            if len(tasks_to_run) > 0:
-                if self.max_threads is not None:
-                    while (
-                        self.threads_used
-                        > self.max_threads - threads_requested * len(tasks_to_run)
-                    ):
-                        await asyncio.sleep(10)
-                self.threads_used += threads_requested * len(tasks_to_run)
-                # python_string = f""""from pydra.engine.helpers import load_and_run
-                #  import sys
-                #  print('sge_task_id:')
-                #  print(sys.argv[1])
-                #  task_pkls={[task_tuple[0] for task_tuple in tasks_to_run]}
-                #  load_and_run(task_pkl=task_pkls[sys.argv[1][0]], ind=task_pkls[sys.argv[1][1]], rerun=task_pkls[sys.argv[1][2]]) \"
-                # """
-                python_string = f"""\"import sys; from pydra.engine.helpers import load_and_run; print(sys.argv[1]); task_pkls={[task_tuple for task_tuple in tasks_to_run]}; task_index=int(sys.argv[1])-1; load_and_run(task_pkl=task_pkls[task_index][0], ind=task_pkls[task_index][1], rerun=task_pkls[task_index][2])\""""
-                #  print(task_pkls[int(sys.argv[1])][0]); print(task_pkls[int(sys.argv[1])][1]); print(task_pkls[int(sys.argv[1])][2]);
-                # if self.write_output_files:
-                #     bcmd = "\n".join(
-                #         (
-                #             f"#!{interpreter}",
-                #             f"#$ -o {str(script_dir)}",
-                #             f"{sys.executable} -c " + python_string,
-                #             f"$SGE_TASK_ID",
-                #         )
-                #     )
-                # else:
-                bcmd = "\n".join(
-                    (
-                        f"#!{interpreter}",
-                        f"{sys.executable} -c " + python_string + " $SGE_TASK_ID",
-                        # f"$SGE_TASK_ID",
-                    )
+        # print(f"self.threads_used: {self.threads_used}")
+        # await self.count_threads_used()
+        if len(tasks_to_run) > 0:
+            if self.max_threads is not None:
+                print(f"self.threads_used: {self.threads_used}")
+                print(f"self.max_threads: {self.max_threads}")
+                print(f"threads_requestd: {threads_requested}")
+                print(f"tasks_to_run: {tasks_to_run}")
+                print(f"len(tasks_to_run): {len(tasks_to_run)}")
+                while self.threads_used > self.max_threads - threads_requested * len(
+                    tasks_to_run
+                ):
+                    await asyncio.sleep(10)
+            self.threads_used += threads_requested * len(tasks_to_run)
+            # python_string = f""""from pydra.engine.helpers import load_and_run
+            #  import sys
+            #  print('sge_task_id:')
+            #  print(sys.argv[1])
+            #  task_pkls={[task_tuple[0] for task_tuple in tasks_to_run]}
+            #  load_and_run(task_pkl=task_pkls[sys.argv[1][0]], ind=task_pkls[sys.argv[1][1]], rerun=task_pkls[sys.argv[1][2]]) \"
+            # """
+            python_string = f"""\"import sys; from pydra.engine.helpers import load_and_run; print(sys.argv[1]); task_pkls={[task_tuple for task_tuple in tasks_to_run]}; task_index=int(sys.argv[1])-1; load_and_run(task_pkl=task_pkls[task_index][0], ind=task_pkls[task_index][1], rerun=task_pkls[task_index][2])\""""
+            #  print(task_pkls[int(sys.argv[1])][0]); print(task_pkls[int(sys.argv[1])][1]); print(task_pkls[int(sys.argv[1])][2]);
+            # if self.write_output_files:
+            #     bcmd = "\n".join(
+            #         (
+            #             f"#!{interpreter}",
+            #             f"#$ -o {str(script_dir)}",
+            #             f"{sys.executable} -c " + python_string,
+            #             f"$SGE_TASK_ID",
+            #         )
+            #     )
+            # else:
+            bcmd = "\n".join(
+                (
+                    f"#!{interpreter}",
+                    f"{sys.executable} -c " + python_string + " $SGE_TASK_ID",
+                    # f"$SGE_TASK_ID",
                 )
+            )
 
-                with batchscript.open("wt") as fp:
-                    fp.writelines(bcmd)
+            with batchscript.open("wt") as fp:
+                fp.writelines(bcmd)
 
-                script_dir = cache_dir / f"{self.__class__.__name__}_scripts" / uid
-                script_dir.mkdir(parents=True, exist_ok=True)
-                sargs = ["-t"]
-                sargs.append(f"1-{len(tasks_to_run)}")
-                sargs = sargs + self.qsub_args.split()
+            script_dir = cache_dir / f"{self.__class__.__name__}_scripts" / uid
+            script_dir.mkdir(parents=True, exist_ok=True)
+            sargs = ["-t"]
+            sargs.append(f"1-{len(tasks_to_run)}")
+            sargs = sargs + self.qsub_args.split()
 
-                jobname = re.search(r"(?<=-N )\S+", self.qsub_args)
+            jobname = re.search(r"(?<=-N )\S+", self.qsub_args)
 
-                if not jobname:
-                    jobname = ".".join((name, uid))
-                    sargs.append("-N")
-                    sargs.append(jobname)
-                output = re.search(r"(?<=-o )\S+", self.qsub_args)
-                # print(f"output: {output}")
-                sargs.append("-pe")
-                sargs.append("smp")
-                sargs.append(f"{threads_requested}")
-                if not output:
-                    output_file = str(script_dir / "sge-%j.out")
-                    if self.write_output_files:
-                        sargs.append("-o")
-                        sargs.append(output_file)
-                error = re.search(r"(?<=-e )\S+", self.qsub_args)
-                if not error:
-                    error_file = str(script_dir / "sge-%j.out")
-                    if self.write_output_files:
-                        sargs.append("-e")
-                        sargs.append(error_file)
-                else:
-                    error_file = None
-                sargs.append(str(batchscript))
+            if not jobname:
+                jobname = ".".join((name, uid))
+                sargs.append("-N")
+                sargs.append(jobname)
+            output = re.search(r"(?<=-o )\S+", self.qsub_args)
+            # print(f"output: {output}")
+            sargs.append("-pe")
+            sargs.append("smp")
+            sargs.append(f"{threads_requested}")
+            if not output:
+                output_file = str(script_dir / "sge-%j.out")
+                if self.write_output_files:
+                    sargs.append("-o")
+                    sargs.append(output_file)
+            error = re.search(r"(?<=-e )\S+", self.qsub_args)
+            if not error:
+                error_file = str(script_dir / "sge-%j.out")
+                if self.write_output_files:
+                    sargs.append("-e")
+                    sargs.append(error_file)
+            else:
+                error_file = None
+            sargs.append(str(batchscript))
 
-                await asyncio.sleep(random.uniform(0, 5))
-                if self.indirect_submit_host is not None:
-                    # submit_host = []
-                    # submit_host.append("ssh")
-                    # submit_host.append(self.indirect_submit_host)
-                    # submit_host.append('""export SGE_ROOT=/opt/sge;')
-                    rc, stdout, stderr = await read_and_display_async(
-                        *self.indirect_submit_host_prefix,
-                        str(self.sge_bin / "qsub"),
-                        *sargs,
-                        '""',
-                        hide_display=True,
-                    )
-                else:
-                    rc, stdout, stderr = await read_and_display_async(
-                        "qsub", *sargs, hide_display=True
-                    )
-                jobid = re.search(r"\d+", stdout)
-                if rc:
-                    raise RuntimeError(f"Error returned from qsub: {stderr}")
-                elif not jobid:
-                    raise RuntimeError("Could not extract job ID")
-                jobid = jobid.group()
-                self.output_by_jobid[jobid] = (rc, stdout, stderr)
+            await asyncio.sleep(random.uniform(0, 5))
+            if self.indirect_submit_host is not None:
+                # submit_host = []
+                # submit_host.append("ssh")
+                # submit_host.append(self.indirect_submit_host)
+                # submit_host.append('""export SGE_ROOT=/opt/sge;')
+                rc, stdout, stderr = await read_and_display_async(
+                    *self.indirect_submit_host_prefix,
+                    str(self.sge_bin / "qsub"),
+                    *sargs,
+                    '""',
+                    hide_display=True,
+                )
+            else:
+                rc, stdout, stderr = await read_and_display_async(
+                    "qsub", *sargs, hide_display=True
+                )
+            jobid = re.search(r"\d+", stdout)
+            if rc:
+                raise RuntimeError(f"Error returned from qsub: {stderr}")
+            elif not jobid:
+                raise RuntimeError("Could not extract job ID")
+            jobid = jobid.group()
+            self.output_by_jobid[jobid] = (rc, stdout, stderr)
 
-                for task_pkl, ind, rerun in tasks_to_run:
-                    # print(
-                    #     f"Adding {jobid} to jobid_by_task_uid by key {Path(task_pkl).parent.name}"
-                    # )
-                    self.jobid_by_task_uid[Path(task_pkl).parent.name] = jobid
+            for task_pkl, ind, rerun in tasks_to_run:
+                # print(
+                #     f"Adding {jobid} to jobid_by_task_uid by key {Path(task_pkl).parent.name}"
+                # )
+                self.jobid_by_task_uid[Path(task_pkl).parent.name] = jobid
 
-                if error_file:
-                    error_file = str(error_file).replace("%j", jobid)
-                self.error[jobid] = str(error_file).replace("%j", jobid)
+            if error_file:
+                error_file = str(error_file).replace("%j", jobid)
+            self.error[jobid] = str(error_file).replace("%j", jobid)
 
-                while True:
-                    # 3 possibilities
-                    # False: job is still pending/working
-                    # True: job is complete
-                    # Exception: Polling / job failure
-                    # done = await self._poll_job(jobid)
-                    done = await self._poll_job(jobid, cache_dir, task_pkl, ind)
-                    print(f"self.job_completed_by_jobid: {self.job_completed_by_jobid}")
-                    if done:
-                        if done in ["ERRORED"] and "--no-requeue" not in self.qsub_args:
-                            # loading info about task with a specific uid
-                            info_file = cache_dir / f"{uid}_info.json"
-                            if info_file.exists():
-                                checksum = json.loads(info_file.read_text())["checksum"]
-                                if (cache_dir / f"{checksum}.lock").exists():
-                                    # for pyt3.8 we could you missing_ok=True
-                                    (cache_dir / f"{checksum}.lock").unlink()
-                            self.job_completed_by_jobid[jobid] = "ERRORED"
-                            return False
-                            # if (
-                            #     threads_requested
-                            #     not in self.tasks_to_run_by_threads_requested
-                            # ):
-                            #     self.tasks_to_run_by_threads_requested[
-                            #         threads_requested
-                            #     ] = []
-                            # self.tasks_to_run_by_threads_requested[
-                            #     threads_requested
-                            # ].append((str(task_pkl), ind, rerun))
-                            # if self.indirect_submit_host is not None:
-                            #     cmd_re = (
-                            #         "ssh",
-                            #         self.indirect_submit_host,
-                            #         f"qmod",
-                            #         "-rj",
-                            #         jobid,
-                            #     )
-                            # else:
-                            #     cmd_re = (f"qmod", "-rj", jobid)
-                            # print("Requeuing")
-                            # await read_and_display_async(*cmd_re, hide_display=True)
-                        else:
-                            # return True
-                            self.job_completed_by_jobid[jobid] = True
-                            self.threads_used -= threads_requested * len(tasks_to_run)
-                            return True
-                    # Don't poll exactly on the same interval to avoid overloading SGE
-                    await asyncio.sleep(
-                        random.uniform(max(0, self.poll_delay - 2), self.poll_delay + 2)
-                    )
+            while True:
+                # 3 possibilities
+                # False: job is still pending/working
+                # True: job is complete
+                # Exception: Polling / job failure
+                # done = await self._poll_job(jobid)
+                done = await self._poll_job(jobid, cache_dir, task_pkl, ind)
+                print(f"self.job_completed_by_jobid: {self.job_completed_by_jobid}")
+                if done:
+                    if done in ["ERRORED"] and "--no-requeue" not in self.qsub_args:
+                        # loading info about task with a specific uid
+                        info_file = cache_dir / f"{uid}_info.json"
+                        if info_file.exists():
+                            checksum = json.loads(info_file.read_text())["checksum"]
+                            if (cache_dir / f"{checksum}.lock").exists():
+                                # for pyt3.8 we could you missing_ok=True
+                                (cache_dir / f"{checksum}.lock").unlink()
+                        self.job_completed_by_jobid[jobid] = "ERRORED"
+                        return False
+                        # if (
+                        #     threads_requested
+                        #     not in self.tasks_to_run_by_threads_requested
+                        # ):
+                        #     self.tasks_to_run_by_threads_requested[
+                        #         threads_requested
+                        #     ] = []
+                        # self.tasks_to_run_by_threads_requested[
+                        #     threads_requested
+                        # ].append((str(task_pkl), ind, rerun))
+                        # if self.indirect_submit_host is not None:
+                        #     cmd_re = (
+                        #         "ssh",
+                        #         self.indirect_submit_host,
+                        #         f"qmod",
+                        #         "-rj",
+                        #         jobid,
+                        #     )
+                        # else:
+                        #     cmd_re = (f"qmod", "-rj", jobid)
+                        # print("Requeuing")
+                        # await read_and_display_async(*cmd_re, hide_display=True)
+                    else:
+                        # return True
+                        self.job_completed_by_jobid[jobid] = True
+                        self.threads_used -= threads_requested * len(tasks_to_run)
+                        return True
+                # Don't poll exactly on the same interval to avoid overloading SGE
+                await asyncio.sleep(
+                    random.uniform(max(0, self.poll_delay - 2), self.poll_delay + 2)
+                )
 
     async def get_output_by_task_pkl(self, task_pkl):
         jobid = self.jobid_by_task_uid.get(task_pkl.parent.name)
@@ -711,11 +730,13 @@ class SGEWorker(DistributedWorker):
             await asyncio.sleep(1)
         return job_output
 
-    async def _submit_job(self, batchscript, name, uid, cache_dir, task_pkl, ind):
+    async def _submit_job(
+        self, batchscript, name, uid, cache_dir, task_pkl, ind, threads_requested
+    ):
 
         """Coroutine that submits task runscript and polls job until completion or error."""
 
-        await self._submit_jobs(batchscript, name, uid, cache_dir)
+        await self._submit_jobs(batchscript, name, uid, cache_dir, threads_requested)
         jobname = ".".join((name, uid))
         # print(f"jobname: {jobname}")
         rc, stdout, stderr = await self.get_output_by_task_pkl(task_pkl)
