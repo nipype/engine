@@ -623,9 +623,6 @@ class TaskBase:
             print("is lazy, so returning False")
             return False
         _result = self.result()
-        print(f"_result: {_result}")
-        print(f"self.state: {self.state}")
-        print(f"self.state.states_ind: {self.state.states_ind}")
         if self.state:
             # print("Here1")
             # TODO: only check for needed state result
