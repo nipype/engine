@@ -659,18 +659,30 @@ class SGEWorker(DistributedWorker):
                                 if (cache_dir / f"{checksum}.lock").exists():
                                     # for pyt3.8 we could you missing_ok=True
                                     (cache_dir / f"{checksum}.lock").unlink()
-                            if self.indirect_submit_host is not None:
-                                cmd_re = (
-                                    "ssh",
-                                    self.indirect_submit_host,
-                                    f"qmod",
-                                    "-rj",
-                                    jobid,
-                                )
-                            else:
-                                cmd_re = (f"qmod", "-rj", jobid)
-                            print("Requeuing")
-                            await read_and_display_async(*cmd_re, hide_display=True)
+                            self.job_completed_by_jobid[jobid] = "ERRORED"
+                            return False
+                            # if (
+                            #     threads_requested
+                            #     not in self.tasks_to_run_by_threads_requested
+                            # ):
+                            #     self.tasks_to_run_by_threads_requested[
+                            #         threads_requested
+                            #     ] = []
+                            # self.tasks_to_run_by_threads_requested[
+                            #     threads_requested
+                            # ].append((str(task_pkl), ind, rerun))
+                            # if self.indirect_submit_host is not None:
+                            #     cmd_re = (
+                            #         "ssh",
+                            #         self.indirect_submit_host,
+                            #         f"qmod",
+                            #         "-rj",
+                            #         jobid,
+                            #     )
+                            # else:
+                            #     cmd_re = (f"qmod", "-rj", jobid)
+                            # print("Requeuing")
+                            # await read_and_display_async(*cmd_re, hide_display=True)
                         else:
                             # return True
                             self.job_completed_by_jobid[jobid] = True
@@ -706,8 +718,13 @@ class SGEWorker(DistributedWorker):
             if self.job_completed_by_jobid.get(jobid) == True:
                 print("Returning true in _submit_job")
                 return True
+            elif self.job_completed_by_jobid.get(jobid) == "ERRORED":
+                return False
             else:
-                await asyncio.sleep(self.poll_delay)
+                # await asyncio.sleep(self.poll_delay)
+                await asyncio.sleep(
+                    random.uniform(max(0, self.poll_delay - 2), self.poll_delay + 2)
+                )
 
         # intermittent polling
         # while True:
