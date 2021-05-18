@@ -476,14 +476,21 @@ class SGEWorker(DistributedWorker):
 
         batchscript = script_dir / f"batchscript_{uid}.job"
 
-        # Set the threads_requested if given in the task input_spec - otherwise set to 1
+        # Set the threads_requested if given in the task input_spec - otherwise set to the default
         try:
             threads_requested = task[-1].inputs.sgeThreads
         except:
             try:
                 threads_requested = task.inputs.sgeThreads
             except:
-                threads_requested = self.default_threads_per_task
+                try:
+                    # itk variable for threads is num_threads
+                    threads_requested = task[-1].inputs.num_threads
+                except:
+                    try:
+                        threads_requested = task.inputs.num_threads
+                    except:
+                        threads_requested = self.default_threads_per_task
 
         if threads_requested not in self.tasks_to_run_by_threads_requested:
             self.tasks_to_run_by_threads_requested[threads_requested] = []
@@ -721,10 +728,10 @@ class SGEWorker(DistributedWorker):
             elif self.job_completed_by_jobid.get(jobid) == "ERRORED":
                 return False
             else:
-                # await asyncio.sleep(self.poll_delay)
-                await asyncio.sleep(
-                    random.uniform(max(0, self.poll_delay - 2), self.poll_delay + 2)
-                )
+                await asyncio.sleep(self.poll_delay)
+                # await asyncio.sleep(
+                #     random.uniform(max(0, self.poll_delay - 2), self.poll_delay + 2)
+                # )
 
         # intermittent polling
         # while True:
