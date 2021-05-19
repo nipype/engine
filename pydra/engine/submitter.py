@@ -172,8 +172,10 @@ class Submitter:
         tasks, tasks_follow_errored = get_runnable_tasks(graph_copy)
         while tasks or task_futures or graph_copy.nodes:
             print(f"tasks: {tasks}")
+            print(f"tasks_follow_errored: {tasks_follow_errored}")
             print(f"task_futures: {task_futures}")
             print(f"graph_copy.nodes: {graph_copy.nodes}")
+
             if not tasks and not task_futures:
                 # it's possible that task_futures is empty, but not able to get any
                 # tasks from graph_copy (using get_runnable_tasks)
@@ -183,6 +185,7 @@ class Submitter:
                 while not tasks and graph_copy.nodes:
                     tasks, follow_err = get_runnable_tasks(graph_copy)
                     ii += 1
+                    print("Sleeping for 1 second")
                     time.sleep(1)
                     if ii > 60:
                         raise Exception(

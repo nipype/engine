@@ -81,20 +81,16 @@ class DistributedWorker(Worker):
     async def fetch_finished(self, futures):
         """
         Awaits asyncio's :class:`asyncio.Task` until one is finished.
-
         Limits number of submissions based on
         py:attr:`DistributedWorker.max_jobs`.
-
         Parameters
         ----------
         futures : set of asyncio awaitables
             Task execution coroutines or asyncio :class:`asyncio.Task`
-
         Returns
         -------
         pending : set
             Pending asyncio :class:`asyncio.Task`.
-
         """
         done, unqueued = set(), set()
         job_slots = self.max_jobs - self._jobs if self.max_jobs else float("inf")
@@ -103,10 +99,6 @@ class DistributedWorker(Worker):
             logger.warning(f"Reducing queued jobs due to max jobs ({self.max_jobs})")
             futures = list(futures)
             futures, unqueued = set(futures[:job_slots]), set(futures[job_slots:])
-            print(f"jobs: {self._jobs}")
-            print(f"futures: {futures}")
-            print(f"unqueued: {unqueued}")
-            await asyncio.sleep(10)
         try:
             self._jobs += len(futures)
             done, pending = await asyncio.wait(
@@ -428,6 +420,7 @@ class SGEWorker(DistributedWorker):
 
     def run_el(self, runnable, rerun=False):
         """Worker submission API."""
+        print("In run_el")
         (
             script_dir,
             batch_script,
@@ -496,7 +489,7 @@ class SGEWorker(DistributedWorker):
                         threads_requested = task.inputs.num_threads
                     except:
                         threads_requested = self.default_threads_per_task
-        if threads_requested == None:
+        if not isinstance(threads_requested, int):
             threads_requested = self.default_threads_per_task
 
         if threads_requested not in self.tasks_to_run_by_threads_requested:
@@ -519,24 +512,6 @@ class SGEWorker(DistributedWorker):
         )
         return tasks_to_run_copy
 
-    async def count_threads_used(self):
-        counted_threads_used = 0
-        cmd = []
-        cmd.append("qstat")
-        cmd.append("-f")
-        cmd.append("-q")
-        cmd.append("HJ")
-        cmd.append("|")
-        cmd.append("grep")
-        cmd.append("-P")
-        cmd.append("'[0-9]{7}'|wc")
-        cmd.append("-l")
-        stdout = await read_and_display_async(
-            *cmd,
-            hide_display=True,
-        )
-        print(f"counted threads used: {stdout}")
-
     async def _submit_jobs(
         self,
         batchscript,
@@ -547,7 +522,7 @@ class SGEWorker(DistributedWorker):
         interpreter="/bin/sh",
     ):
         # for threads_requested in self.tasks_to_run_by_threads_requested:
-
+        print("in _submit_jobs")
         if (
             len(self.tasks_to_run_by_threads_requested.get(threads_requested))
             <= self.max_job_array_length
@@ -557,8 +532,6 @@ class SGEWorker(DistributedWorker):
         # self.threads_used += len(tasks_to_run)
         print(f"self.threads_used: {self.threads_used}")
 
-        # print(f"self.threads_used: {self.threads_used}")
-        # await self.count_threads_used()
         if len(tasks_to_run) > 0:
             if self.max_threads is not None:
                 print(f"self.threads_used: {self.threads_used}")
@@ -686,29 +659,29 @@ class SGEWorker(DistributedWorker):
                                 # for pyt3.8 we could you missing_ok=True
                                 (cache_dir / f"{checksum}.lock").unlink()
                         self.job_completed_by_jobid[jobid] = "ERRORED"
-                        return False
-                        # if (
-                        #     threads_requested
-                        #     not in self.tasks_to_run_by_threads_requested
-                        # ):
-                        #     self.tasks_to_run_by_threads_requested[
-                        #         threads_requested
-                        #     ] = []
-                        # self.tasks_to_run_by_threads_requested[
-                        #     threads_requested
-                        # ].append((str(task_pkl), ind, rerun))
-                        # if self.indirect_submit_host is not None:
-                        #     cmd_re = (
-                        #         "ssh",
-                        #         self.indirect_submit_host,
-                        #         f"qmod",
-                        #         "-rj",
-                        #         jobid,
-                        #     )
-                        # else:
-                        #     cmd_re = (f"qmod", "-rj", jobid)
-                        # print("Requeuing")
-                        # await read_and_display_async(*cmd_re, hide_display=True)
+                        # return False
+                        if (
+                            threads_requested
+                            not in self.tasks_to_run_by_threads_requested
+                        ):
+                            self.tasks_to_run_by_threads_requested[
+                                threads_requested
+                            ] = []
+                        self.tasks_to_run_by_threads_requested[
+                            threads_requested
+                        ].append((str(task_pkl), ind, rerun))
+                        if self.indirect_submit_host is not None:
+                            cmd_re = (
+                                "ssh",
+                                self.indirect_submit_host,
+                                f"qmod",
+                                "-rj",
+                                jobid,
+                            )
+                        else:
+                            cmd_re = (f"qmod", "-rj", jobid)
+                        print("Requeuing")
+                        await read_and_display_async(*cmd_re, hide_display=True)
                     else:
                         # return True
                         self.job_completed_by_jobid[jobid] = True
@@ -733,10 +706,12 @@ class SGEWorker(DistributedWorker):
     async def _submit_job(
         self, batchscript, name, uid, cache_dir, task_pkl, ind, threads_requested
     ):
+        print("in _submit_job")
 
         """Coroutine that submits task runscript and polls job until completion or error."""
 
         await self._submit_jobs(batchscript, name, uid, cache_dir, threads_requested)
+        print("after await self._submit_jobs")
         jobname = ".".join((name, uid))
         # print(f"jobname: {jobname}")
         rc, stdout, stderr = await self.get_output_by_task_pkl(task_pkl)
@@ -745,9 +720,30 @@ class SGEWorker(DistributedWorker):
         while True:
             if self.job_completed_by_jobid.get(jobid) == True:
                 print("Returning true in _submit_job")
-                return True
-            elif self.job_completed_by_jobid.get(jobid) == "ERRORED":
-                return False
+                task = load_task(task_pkl, ind=ind)
+                resultfile = task.output_dir / "_result.pklz"
+                print(f"Checking for job completion: {resultfile}")
+                if resultfile.exists():
+                    result = load_result(Path(task.output_dir.name), [cache_dir])
+                    if result is not None:
+                        if result.errored == False:
+                            return True
+
+                # If the job has been completed but errored, rerun the task
+                print("Rerunning task")
+                info_file = cache_dir / f"{uid}_info.json"
+                if info_file.exists():
+                    checksum = json.loads(info_file.read_text())["checksum"]
+                    if (cache_dir / f"{checksum}.lock").exists():
+                        # for pyt3.8 we could you missing_ok=True
+                        (cache_dir / f"{checksum}.lock").unlink()
+                self._submit_job(
+                    batchscript, name, uid, cache_dir, task_pkl, ind, threads_requested
+                )
+
+            # elif self.job_completed_by_jobid.get(jobid) == "ERRORED":
+            #     print("Returning false in _submit_job")
+            #     return False
             else:
                 await asyncio.sleep(self.poll_delay)
                 # await asyncio.sleep(
