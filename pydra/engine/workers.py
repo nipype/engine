@@ -9,18 +9,10 @@ from shutil import copyfile, which
 import concurrent.futures as cf
 
 from .core import TaskBase
-from .helpers import (
-    get_available_cpus,
-    read_and_display_async,
-    save,
-    load_and_run,
-    load_task,
-    load_result,
-)
+from .helpers import get_available_cpus, read_and_display_async, save, load_and_run
 
 import logging
 
-import psutil
 import random
 
 logger = logging.getLogger("pydra.worker")
@@ -81,16 +73,20 @@ class DistributedWorker(Worker):
     async def fetch_finished(self, futures):
         """
         Awaits asyncio's :class:`asyncio.Task` until one is finished.
+
         Limits number of submissions based on
         py:attr:`DistributedWorker.max_jobs`.
+
         Parameters
         ----------
         futures : set of asyncio awaitables
             Task execution coroutines or asyncio :class:`asyncio.Task`
+
         Returns
         -------
         pending : set
             Pending asyncio :class:`asyncio.Task`.
+
         """
         done, unqueued = set(), set()
         job_slots = self.max_jobs - self._jobs if self.max_jobs else float("inf")
@@ -260,8 +256,6 @@ class SlurmWorker(DistributedWorker):
             fp.writelines(bcmd)
         return script_dir, batchscript
 
-    # async def files_available()
-
     async def _submit_job(self, batchscript, name, uid, cache_dir):
         """Coroutine that submits task runscript and polls job until completion or error."""
         script_dir = cache_dir / f"{self.__class__.__name__}_scripts" / uid
@@ -273,16 +267,12 @@ class SlurmWorker(DistributedWorker):
         output = re.search(r"(?<=-o )\S+|(?<=--output=)\S+", self.sbatch_args)
         if not output:
             output_file = str(script_dir / "slurm-%j.out")
-            # sargs.append(f"--output={output_file}")
         error = re.search(r"(?<=-e )\S+|(?<=--error=)\S+", self.sbatch_args)
         if not error:
             error_file = str(script_dir / "slurm-%j.err")
-            # sargs.append(f"-e {error_file}")
         else:
             error_file = None
         sargs.append(str(batchscript))
-        # while psutil.Process(os.getpid()).as_dict()["num_fds"] > 1000:
-        #     pass
         # TO CONSIDER: add random sleep to avoid overloading calls
         rc, stdout, stderr = await read_and_display_async(
             "sbatch", *sargs, hide_display=True
@@ -400,27 +390,16 @@ class SGEWorker(DistributedWorker):
         )
         self.tasks_to_run_by_threads_requested = {}
         self.output_by_jobid = {}
-        self.job_id_by_jobname = {}
         self.jobid_by_task_uid = {}
         self.max_job_array_length = max_job_array_length
         self.threads_used = 0
-        # self.max_threads = 500
         self.job_completed_by_jobid = {}
         self.indirect_submit_host = indirect_submit_host
-        self.sge_bin = Path(which("qsub")).parent
-        self.indirect_submit_host_prefix = []
-        if indirect_submit_host is not None:
-            self.indirect_submit_host_prefix = []
-            self.indirect_submit_host_prefix.append("ssh")
-            self.indirect_submit_host_prefix.append(self.indirect_submit_host)
-            self.indirect_submit_host_prefix.append('""export SGE_ROOT=/opt/sge;')
-        self.event_loop = asyncio.new_event_loop()
         self.max_threads = max_threads
         self.default_threads_per_task = default_threads_per_task
 
     def run_el(self, runnable, rerun=False):
         """Worker submission API."""
-        print("In run_el")
         (
             script_dir,
             batch_script,
@@ -450,7 +429,6 @@ class SGEWorker(DistributedWorker):
         )
 
     def _prepare_runscripts(self, task, interpreter="/bin/sh", rerun=False):
-        # print(f"_prepare_runscripts task: {task}")
         if isinstance(task, TaskBase):
             cache_dir = task.cache_dir
             ind = None
@@ -482,7 +460,7 @@ class SGEWorker(DistributedWorker):
                 threads_requested = task.inputs.sgeThreads
             except:
                 try:
-                    # itk variable for threads is num_threads
+                    # itk variable for threads is num_threads - check if that has been set
                     threads_requested = task[-1].inputs.num_threads
                 except:
                     try:
@@ -522,52 +500,27 @@ class SGEWorker(DistributedWorker):
         interpreter="/bin/sh",
     ):
         # for threads_requested in self.tasks_to_run_by_threads_requested:
-        print("in _submit_jobs")
         if (
             len(self.tasks_to_run_by_threads_requested.get(threads_requested))
             <= self.max_job_array_length
         ):
-            await asyncio.sleep(10)
+            await asyncio.sleep(self.poll_delay)
         tasks_to_run = await self.get_tasks_to_run(threads_requested)
         # self.threads_used += len(tasks_to_run)
-        print(f"self.threads_used: {self.threads_used}")
 
         if len(tasks_to_run) > 0:
             if self.max_threads is not None:
-                print(f"self.threads_used: {self.threads_used}")
-                print(f"self.max_threads: {self.max_threads}")
-                print(f"threads_requestd: {threads_requested}")
-                print(f"tasks_to_run: {tasks_to_run}")
-                print(f"len(tasks_to_run): {len(tasks_to_run)}")
                 while self.threads_used > self.max_threads - threads_requested * len(
                     tasks_to_run
                 ):
-                    await asyncio.sleep(10)
+                    await asyncio.sleep(self.poll_delay)
             self.threads_used += threads_requested * len(tasks_to_run)
-            # python_string = f""""from pydra.engine.helpers import load_and_run
-            #  import sys
-            #  print('sge_task_id:')
-            #  print(sys.argv[1])
-            #  task_pkls={[task_tuple[0] for task_tuple in tasks_to_run]}
-            #  load_and_run(task_pkl=task_pkls[sys.argv[1][0]], ind=task_pkls[sys.argv[1][1]], rerun=task_pkls[sys.argv[1][2]]) \"
-            # """
-            python_string = f"""\"import sys; from pydra.engine.helpers import load_and_run; print(sys.argv[1]); task_pkls={[task_tuple for task_tuple in tasks_to_run]}; task_index=int(sys.argv[1])-1; load_and_run(task_pkl=task_pkls[task_index][0], ind=task_pkls[task_index][1], rerun=task_pkls[task_index][2])\""""
-            #  print(task_pkls[int(sys.argv[1])][0]); print(task_pkls[int(sys.argv[1])][1]); print(task_pkls[int(sys.argv[1])][2]);
-            # if self.write_output_files:
-            #     bcmd = "\n".join(
-            #         (
-            #             f"#!{interpreter}",
-            #             f"#$ -o {str(script_dir)}",
-            #             f"{sys.executable} -c " + python_string,
-            #             f"$SGE_TASK_ID",
-            #         )
-            #     )
-            # else:
+
+            python_string = f"""\"import sys; from pydra.engine.helpers import load_and_run; task_pkls={[task_tuple for task_tuple in tasks_to_run]}; task_index=int(sys.argv[1])-1; load_and_run(task_pkl=task_pkls[task_index][0], ind=task_pkls[task_index][1], rerun=task_pkls[task_index][2])\""""
             bcmd = "\n".join(
                 (
                     f"#!{interpreter}",
                     f"{sys.executable} -c " + python_string + " $SGE_TASK_ID",
-                    # f"$SGE_TASK_ID",
                 )
             )
 
@@ -587,7 +540,6 @@ class SGEWorker(DistributedWorker):
                 sargs.append("-N")
                 sargs.append(jobname)
             output = re.search(r"(?<=-o )\S+", self.qsub_args)
-            # print(f"output: {output}")
             sargs.append("-pe")
             sargs.append("smp")
             sargs.append(f"{threads_requested}")
@@ -607,35 +559,8 @@ class SGEWorker(DistributedWorker):
             sargs.append(str(batchscript))
 
             await asyncio.sleep(random.uniform(0, 5))
-            if self.indirect_submit_host is not None:
-                rc, stdout, stderr = await read_and_display_async(
-                    *self.indirect_submit_host_prefix,
-                    str(self.sge_bin / "qsub"),
-                    *sargs,
-                    '""',
-                    hide_display=True,
-                )
-            else:
-                rc, stdout, stderr = await read_and_display_async(
-                    "qsub", *sargs, hide_display=True
-                )
-            jobid = re.search(r"\d+", stdout)
-            if rc:
-                raise RuntimeError(f"Error returned from qsub: {stderr}")
-            elif not jobid:
-                raise RuntimeError("Could not extract job ID")
-            jobid = jobid.group()
-            self.output_by_jobid[jobid] = (rc, stdout, stderr)
 
-            for task_pkl, ind, rerun in tasks_to_run:
-                # print(
-                #     f"Adding {jobid} to jobid_by_task_uid by key {Path(task_pkl).parent.name}"
-                # )
-                self.jobid_by_task_uid[Path(task_pkl).parent.name] = jobid
-
-            if error_file:
-                error_file = str(error_file).replace("%j", jobid)
-            self.error[jobid] = str(error_file).replace("%j", jobid)
+            jobid = await self.submit_array_job(sargs, tasks_to_run, error_file)
 
             while True:
                 # 3 possibilities
@@ -643,12 +568,9 @@ class SGEWorker(DistributedWorker):
                 # True: job is complete
                 # Exception: Polling / job failure
                 # done = await self._poll_job(jobid)
-                done = await self._poll_job(jobid, cache_dir, task_pkl, ind)
-                print(f"done: {done}")
-                print(f"self.job_completed_by_jobid: {self.job_completed_by_jobid}")
+                done = await self._poll_job(jobid, cache_dir)
                 if done:
-                    if done in ["ERRORED"]:
-                        # print(f"done is ERRORED")
+                    if done in ["ERRORED"]:  # If the SGE job was evicted, rerun it
                         # # loading info about task with a specific uid
                         info_file = cache_dir / f"{uid}_info.json"
                         if info_file.exists():
@@ -656,43 +578,54 @@ class SGEWorker(DistributedWorker):
                             if (cache_dir / f"{checksum}.lock").exists():
                                 # for pyt3.8 we could you missing_ok=True
                                 (cache_dir / f"{checksum}.lock").unlink()
-                        if self.indirect_submit_host is not None:
-                            rc, stdout, stderr = await read_and_display_async(
-                                *self.indirect_submit_host_prefix,
-                                str(self.sge_bin / "qsub"),
-                                *sargs,
-                                '""',
-                                hide_display=True,
-                            )
-                        else:
-                            rc, stdout, stderr = await read_and_display_async(
-                                "qsub", *sargs, hide_display=True
-                            )
-                        jobid = re.search(r"\d+", stdout)
-                        print(f"New jobid: {jobid}")
-                        if rc:
-                            raise RuntimeError(f"Error returned from qsub: {stderr}")
-                        elif not jobid:
-                            raise RuntimeError("Could not extract job ID")
-                        jobid = jobid.group()
-                        self.output_by_jobid[jobid] = (rc, stdout, stderr)
-
-                        for task_pkl, ind, rerun in tasks_to_run:
-
-                            self.jobid_by_task_uid[Path(task_pkl).parent.name] = jobid
-
-                        if error_file:
-                            error_file = str(error_file).replace("%j", jobid)
-                        self.error[jobid] = str(error_file).replace("%j", jobid)
+                        # If the previous job array failed, run the array's script again and get the new jobid
+                        jobid = await self.submit_array_job(
+                            sargs, tasks_to_run, error_file
+                        )
                     else:
                         # return True
                         self.job_completed_by_jobid[jobid] = True
                         self.threads_used -= threads_requested * len(tasks_to_run)
                         return True
+
                 # Don't poll exactly on the same interval to avoid overloading SGE
                 await asyncio.sleep(
                     random.uniform(max(0, self.poll_delay - 2), self.poll_delay + 2)
                 )
+
+    async def submit_array_job(self, sargs, tasks_to_run, error_file):
+        if self.indirect_submit_host is not None:
+            indirect_submit_host_prefix = []
+            indirect_submit_host_prefix.append("ssh")
+            indirect_submit_host_prefix.append(self.indirect_submit_host)
+            indirect_submit_host_prefix.append('""export SGE_ROOT=/opt/sge;')
+            rc, stdout, stderr = await read_and_display_async(
+                *indirect_submit_host_prefix,
+                str(Path(which("qsub")).parent / "qsub"),
+                *sargs,
+                '""',
+                hide_display=True,
+            )
+        else:
+            rc, stdout, stderr = await read_and_display_async(
+                "qsub", *sargs, hide_display=True
+            )
+        jobid = re.search(r"\d+", stdout)
+        if rc:
+            raise RuntimeError(f"Error returned from qsub: {stderr}")
+        elif not jobid:
+            raise RuntimeError("Could not extract job ID")
+        jobid = jobid.group()
+        self.output_by_jobid[jobid] = (rc, stdout, stderr)
+
+        for task_pkl, ind, rerun in tasks_to_run:
+
+            self.jobid_by_task_uid[Path(task_pkl).parent.name] = jobid
+
+        if error_file:
+            error_file = str(error_file).replace("%j", jobid)
+        self.error[jobid] = str(error_file).replace("%j", jobid)
+        return jobid
 
     async def get_output_by_task_pkl(self, task_pkl):
         jobid = self.jobid_by_task_uid.get(task_pkl.parent.name)
@@ -708,33 +641,25 @@ class SGEWorker(DistributedWorker):
     async def _submit_job(
         self, batchscript, name, uid, cache_dir, task_pkl, ind, threads_requested
     ):
-        print("in _submit_job")
-
         """Coroutine that submits task runscript and polls job until completion or error."""
 
         await self._submit_jobs(batchscript, name, uid, cache_dir, threads_requested)
-        print("after await self._submit_jobs")
         jobname = ".".join((name, uid))
-        # print(f"jobname: {jobname}")
         rc, stdout, stderr = await self.get_output_by_task_pkl(task_pkl)
 
         while True:
             jobid = self.jobid_by_task_uid.get(task_pkl.parent.name)
-            print(
-                f"self.job_completed_by_jobid.get({jobid}): {self.job_completed_by_jobid.get(jobid)}"
-            )
             if self.job_completed_by_jobid.get(jobid) == True:
                 return True
             else:
                 await asyncio.sleep(self.poll_delay)
 
-    async def _poll_job(self, jobid, cache_dir, task_pkl, ind):
+    async def _poll_job(self, jobid, cache_dir):
         cmd = (f"qstat", "-j", jobid)
-        # print(f"jobs: {self._jobs}")
         logger.debug(f"Polling job {jobid}")
         rc, stdout, stderr = await read_and_display_async(*cmd, hide_display=True)
 
-        if not stdout or "slurm_load_jobs error" in stderr:
+        if not stdout:
             # job is no longer running - check exit code
             status = await self._verify_exit_code(jobid)
             return status
@@ -742,18 +667,15 @@ class SGEWorker(DistributedWorker):
 
     async def _verify_exit_code(self, jobid):
         cmd = (f"qacct", "-j", jobid)
-        # print(psutil.Process(os.getpid()).as_dict()["num_fds"])
         rc, stdout, stderr = await read_and_display_async(*cmd, hide_display=True)
 
         # job is still pending/working
         if re.match(r"error: job id .* not found", stderr):
-            # print("Returning false")
             return False
 
         # Read the qacct stdout into dictionary stdout_dict
         stdout_dict = {}
         for line in stdout.splitlines():
-            # print(f"New line")
             key_value = line.split(None, 1)
             if len(key_value) > 1:
                 stdout_dict[key_value[0]] = key_value[1]
@@ -766,10 +688,7 @@ class SGEWorker(DistributedWorker):
         if [int(s) for s in stdout_dict["failed"].split() if s.isdigit()][0] == 0:
             return True
         else:
-            # error_message = "Job failed (unknown reason - TODO)"
-            # raise Exception(error_message)
-            return "ERRORED"
-        # print("Returning True - reached end")
+            return "ERRORED"  # SGE job failed
         return True
 
 
