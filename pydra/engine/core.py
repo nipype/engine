@@ -615,29 +615,21 @@ class TaskBase:
 
     @property
     def done(self):
-
         """Check whether the tasks has been finalized and all outputs are stored."""
-        # print("Checking for done")
         # if any of the field is lazy, there is no need to check results
         if is_lazy(self.inputs):
-            print("is lazy, so returning False")
             return False
         _result = self.result()
         if self.state:
-            # print("Here1")
             # TODO: only check for needed state result
             if _result and all(_result):
-                # print("Here3")
                 if self.state.combiner and isinstance(_result[0], list):
                     for res_l in _result:
                         if any([res.errored for res in res_l]):
-                            print(f"1Task {self.name} raised an error")
                             raise ValueError(f"Task {self.name} raised an error")
                     return True
                 else:
-                    # print("Here4")
                     if any([res.errored for res in _result]):
-                        print(f"2Task {self.name} raised an error")
                         raise ValueError(f"Task {self.name} raised an error")
                     return True
             # checking if self.result() is not an empty list only because
@@ -647,18 +639,10 @@ class TaskBase:
                 and hasattr(self.state, "states_ind")
                 and self.state.states_ind == []
             ):
-                # print("Here5")
                 return True
-            # else:
-            #     print("Here6")
-            #     print(f"_result: {_result}")
-            #     print(f"self.state: {self.state}")
-            #     print(f"self.state.states_ind: {self.state.states_ind}")
         else:
-            print("Here2")
             if _result:
                 if _result.errored:
-                    print(f"_result.errored: {_result.errored}")
                     self._errored = True
                     raise ValueError(f"Task {self.name} raised an error")
                 else:
