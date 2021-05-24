@@ -11,8 +11,10 @@ from ..core import Workflow
 from ..task import ShellCommandTask
 from ..submitter import Submitter
 from ... import mark
+from pathlib import Path
 
 slurm_available = bool(shutil.which("sbatch"))
+sge_available = bool(shutil.which("qsub"))
 
 
 @mark.task
@@ -375,3 +377,22 @@ def test_slurm_cancel_rerun_2(tmpdir):
     with pytest.raises(Exception):
         with Submitter("slurm", sbatch_args="--no-requeue") as sub:
             sub(wf)
+
+
+@pytest.mark.skipif(not sge_available, reason="sge not installed")
+def test_sge_wf(tmpdir):
+    wf = gen_basic_wf()
+    tmpdir = Path("/Shared/sinapse/pydra-cjohnson/tmp")
+    wf.cache_dir = tmpdir
+    # submit workflow and every task as slurm job
+    with Submitter(
+        "sge",
+    ) as sub:
+        sub(wf)
+
+    res = wf.result()
+    assert res.output.out == 9
+    script_dir = tmpdir / "SGEWorker_scripts"
+    assert script_dir.exists()
+    # ensure each task was executed with sge
+    assert len([sd for sd in script_dir.glob("*/**") if sd.is_dir()]) == 2
