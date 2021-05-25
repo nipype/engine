@@ -364,8 +364,11 @@ class SGEWorker(DistributedWorker):
         max_job_array_length=50,
         indirect_submit_host=None,
         max_threads=None,
+        poll_for_result_file=False,
         default_threads_per_task=1,
+        polls_before_checking_evicted=60,
     ):
+        print("in __init__")
         """
         Initialize SLURM Worker.
 
@@ -386,7 +389,7 @@ class SGEWorker(DistributedWorker):
         self.qsub_args = qsub_args or ""
         self.error = {}
         self.write_output_files = (
-            write_output_files  # avoid OSError: Too many open files
+            write_output_files  # set to False to avoid OSError: Too many open files
         )
         self.tasks_to_run_by_threads_requested = {}
         self.output_by_jobid = {}
@@ -397,15 +400,20 @@ class SGEWorker(DistributedWorker):
         self.indirect_submit_host = indirect_submit_host
         self.max_threads = max_threads
         self.default_threads_per_task = default_threads_per_task
+        self.poll_for_result_file = poll_for_result_file
+        self.polls_before_checking_evicted = polls_before_checking_evicted
+        print("end __init__")
 
     def run_el(self, runnable, rerun=False):
         """Worker submission API."""
+        print("in run_el")
         (
             script_dir,
             batch_script,
             task_pkl,
             ind,
             threads_requested,
+            output_dir,
         ) = self._prepare_runscripts(runnable, rerun=rerun)
         if (script_dir / script_dir.parts[1]) == gettempdir():
             logger.warning("Temporary directories may not be shared across computers")
@@ -417,6 +425,7 @@ class SGEWorker(DistributedWorker):
             cache_dir = runnable[-1].cache_dir
             name = runnable[-1].name
             uid = f"{runnable[-1].uid}_{runnable[0]}"
+        print("end run_el")
 
         return self._submit_job(
             batch_script,
@@ -426,9 +435,15 @@ class SGEWorker(DistributedWorker):
             task_pkl=task_pkl,
             ind=ind,
             threads_requested=threads_requested,
+            output_dir=output_dir,
         )
 
     def _prepare_runscripts(self, task, interpreter="/bin/sh", rerun=False):
+        print("in _prepare_runscripts")
+        print(f"task: {task}")
+        print(f"task.cache_dir: {task.cache_dir}")
+        print(f"task.cache_locations: {task.cache_locations}")
+        print(f"task.output_dir: {task.output_dir}")
         if isinstance(task, TaskBase):
             cache_dir = task.cache_dir
             ind = None
@@ -476,9 +491,18 @@ class SGEWorker(DistributedWorker):
             (str(task_pkl), ind, rerun)
         )
 
-        return script_dir, batchscript, task_pkl, ind, threads_requested
+        print("end _prepare_runscripts")
+        return (
+            script_dir,
+            batchscript,
+            task_pkl,
+            ind,
+            threads_requested,
+            task.output_dir,
+        )
 
     async def get_tasks_to_run(self, threads_requested):
+        print("in get_tasks_to_run")
         # Extract the first N tasks to run
         tasks_to_run_copy, self.tasks_to_run_by_threads_requested[threads_requested] = (
             self.tasks_to_run_by_threads_requested[threads_requested][
@@ -488,6 +512,7 @@ class SGEWorker(DistributedWorker):
                 self.max_job_array_length :
             ],
         )
+        print("end get_tasks_to_run")
         return tasks_to_run_copy
 
     async def _submit_jobs(
@@ -497,8 +522,10 @@ class SGEWorker(DistributedWorker):
         uid,
         cache_dir,
         threads_requested,
+        output_dir,
         interpreter="/bin/sh",
     ):
+        print("in _submit_jobs")
         # for threads_requested in self.tasks_to_run_by_threads_requested:
         if (
             len(self.tasks_to_run_by_threads_requested.get(threads_requested))
@@ -506,7 +533,6 @@ class SGEWorker(DistributedWorker):
         ):
             await asyncio.sleep(self.poll_delay)
         tasks_to_run = await self.get_tasks_to_run(threads_requested)
-        # self.threads_used += len(tasks_to_run)
 
         if len(tasks_to_run) > 0:
             if self.max_threads is not None:
@@ -516,16 +542,33 @@ class SGEWorker(DistributedWorker):
                     await asyncio.sleep(self.poll_delay)
             self.threads_used += threads_requested * len(tasks_to_run)
 
-            python_string = f"""\"import sys; from pydra.engine.helpers import load_and_run; task_pkls={[task_tuple for task_tuple in tasks_to_run]}; task_index=int(sys.argv[1])-1; load_and_run(task_pkl=task_pkls[task_index][0], ind=task_pkls[task_index][1], rerun=task_pkls[task_index][2])\""""
-            bcmd = "\n".join(
+            python_string = f"""import sys; from pydra.engine.helpers import load_and_run; task_pkls={[task_tuple for task_tuple in tasks_to_run]}; task_index=int(sys.argv[1])-1; load_and_run(task_pkl=task_pkls[task_index][0], ind=task_pkls[task_index][1], rerun=task_pkls[task_index][2])"""
+            bcmd_job = "\n".join(
                 (
                     f"#!{interpreter}",
-                    f"{sys.executable} -c " + python_string + " $SGE_TASK_ID",
+                    f"{sys.executable} {Path(batchscript).with_suffix('.py')}"
+                    + " $SGE_TASK_ID",
                 )
             )
 
+            bcmd_py = python_string
+
+            with Path(batchscript).with_suffix(".py").open("wt") as fp:
+                fp.write(bcmd_py)
+
             with batchscript.open("wt") as fp:
-                fp.writelines(bcmd)
+                fp.writelines(bcmd_job)
+
+            # python_string = f"""\"import sys; from pydra.engine.helpers import load_and_run; task_pkls={[task_tuple for task_tuple in tasks_to_run]}; task_index=int(sys.argv[1])-1; load_and_run(task_pkl=task_pkls[task_index][0], ind=task_pkls[task_index][1], rerun=task_pkls[task_index][2])\""""
+            # bcmd = "\n".join(
+            #     (
+            #         f"#!{interpreter}",
+            #         f"{sys.executable} -c " + python_string + " $SGE_TASK_ID",
+            #     )
+            # )
+
+            # with batchscript.open("wt") as fp:
+            #     fp.writelines(bcmd)
 
             script_dir = cache_dir / f"{self.__class__.__name__}_scripts" / uid
             script_dir.mkdir(parents=True, exist_ok=True)
@@ -561,6 +604,9 @@ class SGEWorker(DistributedWorker):
             await asyncio.sleep(random.uniform(0, 5))
 
             jobid = await self.submit_array_job(sargs, tasks_to_run, error_file)
+            print(jobid)
+
+            poll_counter = 0
 
             while True:
                 # 3 possibilities
@@ -568,32 +614,54 @@ class SGEWorker(DistributedWorker):
                 # True: job is complete
                 # Exception: Polling / job failure
                 # done = await self._poll_job(jobid)
-                done = await self._poll_job(jobid, cache_dir)
-                if done:
-                    if done in ["ERRORED"]:  # If the SGE job was evicted, rerun it
-                        # # loading info about task with a specific uid
-                        info_file = cache_dir / f"{uid}_info.json"
-                        if info_file.exists():
-                            checksum = json.loads(info_file.read_text())["checksum"]
-                            if (cache_dir / f"{checksum}.lock").exists():
-                                # for pyt3.8 we could you missing_ok=True
-                                (cache_dir / f"{checksum}.lock").unlink()
-                        # If the previous job array failed, run the array's script again and get the new jobid
-                        jobid = await self.submit_array_job(
-                            sargs, tasks_to_run, error_file
-                        )
-                    else:
-                        # return True
-                        self.job_completed_by_jobid[jobid] = True
-                        self.threads_used -= threads_requested * len(tasks_to_run)
+                if not self.poll_for_result_file:
+                    result_file = output_dir / "_result.pklz"
+                    if result_file.exists():
                         return True
+                    elif poll_counter == self.polls_before_checking_evicted:
+                        exit_status = await self._verify_exit_code(jobid)
+                        if exit_status == "ERRORED":
+                            jobid = await self._rerun_job_array(
+                                cache_dir, uid, sargs, tasks_to_run, error_file
+                            )
+                        poll_counter = 0
+                    poll_counter += 1
+                    await asyncio.sleep(self.poll_delay)
+                else:
+                    done = await self._poll_job(jobid, cache_dir)
+                    if done:
+                        if done in ["ERRORED"]:  # If the SGE job was evicted, rerun it
+                            jobid = await self._rerun_job_array(
+                                cache_dir, uid, sargs, tasks_to_run, error_file
+                            )
+                        else:
+                            # return True
+                            self.job_completed_by_jobid[jobid] = True
+                            self.threads_used -= threads_requested * len(tasks_to_run)
+                            return True
 
-                # Don't poll exactly on the same interval to avoid overloading SGE
-                await asyncio.sleep(
-                    random.uniform(max(0, self.poll_delay - 2), self.poll_delay + 2)
-                )
+                    # Don't poll exactly on the same interval to avoid overloading SGE
+                    await asyncio.sleep(
+                        random.uniform(max(0, self.poll_delay - 2), self.poll_delay + 2)
+                    )
+
+        print("end _submit_jobs")
+
+    async def _rerun_job_array(self, cache_dir, uid, sargs, tasks_to_run, error_file):
+        print("Rerunning job array")
+        # # loading info about task with a specific uid
+        info_file = cache_dir / f"{uid}_info.json"
+        if info_file.exists():
+            checksum = json.loads(info_file.read_text())["checksum"]
+            if (cache_dir / f"{checksum}.lock").exists():
+                # for pyt3.8 we could use missing_ok=True
+                (cache_dir / f"{checksum}.lock").unlink()
+        # If the previous job array failed, run the array's script again and get the new jobid
+        jobid = await self.submit_array_job(sargs, tasks_to_run, error_file)
+        return jobid
 
     async def submit_array_job(self, sargs, tasks_to_run, error_file):
+        print("in submit_array_job")
         if self.indirect_submit_host is not None:
             indirect_submit_host_prefix = []
             indirect_submit_host_prefix.append("ssh")
@@ -625,9 +693,11 @@ class SGEWorker(DistributedWorker):
         if error_file:
             error_file = str(error_file).replace("%j", jobid)
         self.error[jobid] = str(error_file).replace("%j", jobid)
+        print("end __init__")
         return jobid
 
     async def get_output_by_task_pkl(self, task_pkl):
+        print("in get_output_by_task_pkl")
         jobid = self.jobid_by_task_uid.get(task_pkl.parent.name)
         while jobid == None:
             jobid = self.jobid_by_task_uid.get(task_pkl.parent.name)
@@ -636,25 +706,55 @@ class SGEWorker(DistributedWorker):
         while job_output == None:
             job_output = self.output_by_jobid.get(jobid)
             await asyncio.sleep(1)
+        print("end submit_array_job")
         return job_output
 
     async def _submit_job(
-        self, batchscript, name, uid, cache_dir, task_pkl, ind, threads_requested
+        self,
+        batchscript,
+        name,
+        uid,
+        cache_dir,
+        task_pkl,
+        ind,
+        threads_requested,
+        output_dir,
     ):
+        print("in _submit_job")
         """Coroutine that submits task runscript and polls job until completion or error."""
 
-        await self._submit_jobs(batchscript, name, uid, cache_dir, threads_requested)
+        await self._submit_jobs(
+            batchscript, name, uid, cache_dir, threads_requested, output_dir
+        )
         jobname = ".".join((name, uid))
-        rc, stdout, stderr = await self.get_output_by_task_pkl(task_pkl)
 
-        while True:
-            jobid = self.jobid_by_task_uid.get(task_pkl.parent.name)
-            if self.job_completed_by_jobid.get(jobid) == True:
-                return True
-            else:
-                await asyncio.sleep(self.poll_delay)
+        if self.poll_for_result_file:
+            return True
+            # while True:
+            # print(f"batscript={batchscript}")
+            # print(f"name={name}")
+            # print(f"uid={uid}")
+            # print(f"cache_dir={cache_dir}")
+            # print(f"task_pkl={task_pkl}")
+            # print(f"ind={ind}")
+            # print(f"threads_requested={threads_requested}")
+            # result_file = output_dir / "_result.pklz"
+            # if result_file.exists():
+            #     return True
+            # else:
+            #     await asyncio.sleep(self.poll_delay)
+        else:
+            rc, stdout, stderr = await self.get_output_by_task_pkl(task_pkl)
+            while True:
+                jobid = self.jobid_by_task_uid.get(task_pkl.parent.name)
+                if self.job_completed_by_jobid.get(jobid) == True:
+                    return True
+                else:
+                    await asyncio.sleep(self.poll_delay)
+        print("end __init__")
 
     async def _poll_job(self, jobid, cache_dir):
+        print("in _poll_job")
         cmd = (f"qstat", "-j", jobid)
         logger.debug(f"Polling job {jobid}")
         rc, stdout, stderr = await read_and_display_async(*cmd, hide_display=True)
@@ -663,9 +763,11 @@ class SGEWorker(DistributedWorker):
             # job is no longer running - check exit code
             status = await self._verify_exit_code(jobid)
             return status
+        print("end _submit_job")
         return False
 
     async def _verify_exit_code(self, jobid):
+        print("in _verify_exit_code")
         cmd = (f"qacct", "-j", jobid)
         rc, stdout, stderr = await read_and_display_async(*cmd, hide_display=True)
 
@@ -689,6 +791,7 @@ class SGEWorker(DistributedWorker):
             return True
         else:
             return "ERRORED"  # SGE job failed
+        print("end _verify_exit_code")
         return True
 
 
