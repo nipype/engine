@@ -609,19 +609,28 @@ class SGEWorker(DistributedWorker):
                 # Exception: Polling / job failure
                 # done = await self._poll_job(jobid)
                 if self.poll_for_result_file:
+                    print("Checking status of tasks")
                     if len(self.result_files_by_jobid[jobid]) > 0:
                         for task_pkl in list(self.result_files_by_jobid[jobid]):
                             if self.result_files_by_jobid[jobid][task_pkl].exists():
                                 del self.result_files_by_jobid[jobid][task_pkl]
                                 self.threads_used -= threads_requested
                     else:
-                        return True
-
-                    if poll_counter == self.polls_before_checking_evicted:
+                        print("Checking for rerun after completion")
                         exit_status = await self._verify_exit_code(jobid)
                         if exit_status == "ERRORED":
                             jobid = await self._rerun_job_array(
-                                cache_dir, uid, sargs, tasks_to_run, error_file
+                                cache_dir, uid, sargs, tasks_to_run, error_file, jobid
+                            )
+                        else:
+                            return True
+
+                    if poll_counter == self.polls_before_checking_evicted:
+                        print("Periodic checking for rerun ")
+                        exit_status = await self._verify_exit_code(jobid)
+                        if exit_status == "ERRORED":
+                            jobid = await self._rerun_job_array(
+                                cache_dir, uid, sargs, tasks_to_run, error_file, jobid
                             )
                         poll_counter = 0
                     poll_counter += 1
@@ -631,7 +640,7 @@ class SGEWorker(DistributedWorker):
                     if done:
                         if done == "ERRORED":  # If the SGE job was evicted, rerun it
                             jobid = await self._rerun_job_array(
-                                cache_dir, uid, sargs, tasks_to_run, error_file
+                                cache_dir, uid, sargs, tasks_to_run, error_file, jobid
                             )
                         else:
                             self.job_completed_by_jobid[jobid] = True
@@ -642,16 +651,22 @@ class SGEWorker(DistributedWorker):
                         random.uniform(max(0, self.poll_delay - 2), self.poll_delay + 2)
                     )
 
-    async def _rerun_job_array(self, cache_dir, uid, sargs, tasks_to_run, error_file):
+    async def _rerun_job_array(
+        self, cache_dir, uid, sargs, tasks_to_run, error_file, evicted_jobid
+    ):
         # # loading info about task with a specific uid
-        info_file = cache_dir / f"{uid}_info.json"
-        if info_file.exists():
-            checksum = json.loads(info_file.read_text())["checksum"]
-            if (cache_dir / f"{checksum}.lock").exists():
-                # for pyt3.8 we could use missing_ok=True
-                (cache_dir / f"{checksum}.lock").unlink()
+        for task_pkl, ind, rerun in tasks_to_run:
+            task = load_task(task_pkl=task_pkl, ind=ind)
+            print(f"task.uid: {task.uid}")
+            info_file = cache_dir / f"{task.uid}_info.json"
+            if info_file.exists():
+                checksum = json.loads(info_file.read_text())["checksum"]
+                if (cache_dir / f"{checksum}.lock").exists():
+                    # for pyt3.8 we could use missing_ok=True
+                    (cache_dir / f"{checksum}.lock").unlink()
         # If the previous job array failed, run the array's script again and get the new jobid
         jobid = await self.submit_array_job(sargs, tasks_to_run, error_file)
+        self.result_files_by_jobid[jobid] = self.result_files_by_jobid[evicted_jobid]
         return jobid
 
     async def submit_array_job(self, sargs, tasks_to_run, error_file):
