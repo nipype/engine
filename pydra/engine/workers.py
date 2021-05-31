@@ -376,7 +376,7 @@ class SGEWorker(DistributedWorker):
         collect_jobs_delay=30,
     ):
         """
-        Initialize SLURM Worker.
+        Initialize SGE Worker.
 
         Parameters
         ----------
@@ -386,6 +386,24 @@ class SGEWorker(DistributedWorker):
             Additional qsub arguments
         max_jobs : int
             Maximum number of submitted jobs
+        write_output_files : bool
+            Turns on/off writing to output files for individual tasks
+        max_job_array_length : int
+            Number of jobs an SGE job array can hold
+        indirect_submit_host : str
+            Name of a submit node in the SGE cluster through which to run SGE qsub commands
+        max_threads : int
+            Maximum number of threads that will be scheduled for SGE submission at once
+        poll_for_result_file : bool
+            If true, a task is complete when its _result.pklz file exists
+            If false, a task is complete when its job array is indicated complete by qstat/qacct polling
+        default_threads_per_task : int
+            Sets the number of slots SGE should request for a task if sgeThreads
+            is not a field in the task input_spec
+        polls_before_checking_evicted : int
+            Number of poll_delays before running qacct to check if a task has been evicted by SGE
+        collect_jobs_delay : int
+            Number of seconds to wait for the list of jobs for a job array to fill
 
         """
         super().__init__(loop=loop, max_jobs=max_jobs)
@@ -413,6 +431,7 @@ class SGEWorker(DistributedWorker):
 
     def run_el(self, runnable, rerun=False):
         """Worker submission API."""
+        print("In run_el")
         (
             script_dir,
             batch_script,
@@ -421,8 +440,11 @@ class SGEWorker(DistributedWorker):
             threads_requested,
             output_dir,
         ) = self._prepare_runscripts(runnable, rerun=rerun)
+        print("after prepare_runscripts")
+        print("")
         # self.threads_used += threads_requested
         if (script_dir / script_dir.parts[1]) == gettempdir():
+            print("Warning about temp directories")
             logger.warning("Temporary directories may not be shared across computers")
         if isinstance(runnable, TaskBase):
             cache_dir = runnable.cache_dir
@@ -597,7 +619,7 @@ class SGEWorker(DistributedWorker):
                 self.result_files_by_jobid[jobid] = {}
                 for task_pkl, ind, rerun in tasks_to_run:
                     task = load_task(task_pkl=task_pkl, ind=ind)
-                    self.result_files_by_jobid[jobid][task_pkl] = (
+                    self.result_files_by_jobid[jobid][task] = (
                         task.output_dir / "_result.pklz"
                     )
 
@@ -611,10 +633,36 @@ class SGEWorker(DistributedWorker):
                 if self.poll_for_result_file:
                     print("Checking status of tasks")
                     if len(self.result_files_by_jobid[jobid]) > 0:
-                        for task_pkl in list(self.result_files_by_jobid[jobid]):
-                            if self.result_files_by_jobid[jobid][task_pkl].exists():
-                                del self.result_files_by_jobid[jobid][task_pkl]
+                        for task in list(self.result_files_by_jobid[jobid]):
+                            if self.result_files_by_jobid[jobid][task].exists():
+                                del self.result_files_by_jobid[jobid][task]
                                 self.threads_used -= threads_requested
+
+                            # TODO: Periodically check for locked but empty directories and rerun the task
+                            # with the below, the task directory is removed but not its parent workflow directories
+                            # try:
+                            #     print(f"jobid: {jobid}")
+                            #     info_file = cache_dir / f"{task.uid}_info.json"
+                            #     if info_file.exists():
+                            #         checksum = json.loads(info_file.read_text())["checksum"]
+                            #         print(f"checksum: {checksum}")
+                            #         if (cache_dir / f"{checksum}.lock").exists() and any(Path(cache_dir / f"{checksum}").iterdir()):
+                            #             print(f"Path empty: {Path(cache_dir / f'{checksum}')}")
+                            #             # for pyt3.8 we could use missing_ok=True
+                            #             print(f"Unlinking {(cache_dir / f'{checksum}.lock')}")
+                            #             try:
+                            #                 print(f'unlinking {(cache_dir / f"{checksum}.lock")}')
+                            #                 (cache_dir / f"{checksum}.lock").unlink()
+                            #                 # printf(f'Removing {Path(cache_dir / f"{checksum}")}')
+                            #                 # Path(cache_dir / f"{checksum}").rmdir()
+                            #                 print(f"Restarting task: {task}")
+                            #                 task._run_task()
+                            #             except Exception as e:
+                            #                 print(e)
+                            #                 print("Couln't remove all files")
+                            # except Exception as e:
+                            #     print(e)
+
                     else:
                         print("Checking for rerun after completion")
                         exit_status = await self._verify_exit_code(jobid)
@@ -658,12 +706,18 @@ class SGEWorker(DistributedWorker):
         for task_pkl, ind, rerun in tasks_to_run:
             task = load_task(task_pkl=task_pkl, ind=ind)
             print(f"task.uid: {task.uid}")
+            printf(f"task.output_dir: {task.output_dir}")
+            printf(f"task.output_dir: {task.cache_locations}")
             info_file = cache_dir / f"{task.uid}_info.json"
             if info_file.exists():
                 checksum = json.loads(info_file.read_text())["checksum"]
+                print(f"checksum: {checksum}")
                 if (cache_dir / f"{checksum}.lock").exists():
                     # for pyt3.8 we could use missing_ok=True
+                    print(f"Unlinking {(cache_dir / f'{checksum}.lock')}")
                     (cache_dir / f"{checksum}.lock").unlink()
+                else:
+                    print(f"checksum: {checksum} does not exist")
         # If the previous job array failed, run the array's script again and get the new jobid
         jobid = await self.submit_array_job(sargs, tasks_to_run, error_file)
         self.result_files_by_jobid[jobid] = self.result_files_by_jobid[evicted_jobid]
@@ -732,9 +786,14 @@ class SGEWorker(DistributedWorker):
         jobname = ".".join((name, uid))
 
         if self.poll_for_result_file:
-
             while True:
                 result_file = output_dir / "_result.pklz"
+                error_file = output_dir / "_error.pklz"
+                if error_file.exists():
+                    # printf(f'Removing {Path(cache_dir / f"{checksum}" / "_error.pklz")}')
+                    # Path(cache_dir / f"{checksum}" / "_error.pklz").unlink()
+                    # task = load_task(task_pkl=task_pkl, ind=ind)
+                    print(f"{error_file} exists. Consider removing and rerunning.")
                 if result_file.exists():
                     return True
                 await asyncio.sleep(self.poll_delay)
