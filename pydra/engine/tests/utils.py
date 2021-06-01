@@ -12,20 +12,6 @@ from ... import mark
 from ..specs import File
 from ... import set_input_validator
 
-import attr
-SGE_THREADS_INPUT_SPEC = (
-    "sgeThreads",
-    attr.ib(
-        type=int,
-        metadata={
-            "help_string": "The number of threads the Sun Grid engine should use in running this task",
-            "mandatory": False,
-        },
-    ),
-)
-
-
-
 need_docker = pytest.mark.skipif(
     shutil.which("docker") is None or sp.call(["docker", "info"]),
     reason="no docker within the container",
@@ -70,6 +56,7 @@ def fun_addtwo(a):
     if a == 3:
         time.sleep(2)
     return a + 2
+
 
 @mark.task
 def fun_addtwo_with_threadcount(a, sgeThreads=1):
@@ -262,6 +249,7 @@ def gen_basic_wf(name="basic-wf"):
     wf.set_output([("out", wf.task2.lzout.out)])
     return wf
 
+
 def gen_basic_wf_with_threadcount(name="basic-wf-with-threadcount"):
     """
     Generates `Workflow` of two tasks
@@ -281,6 +269,7 @@ def gen_basic_wf_with_threadcount(name="basic-wf-with-threadcount"):
     wf.set_output([("out", wf.task2.lzout.out)])
     return wf
 
+
 def gen_basic_wf_with_threadcount_concurrent(name="basic-wf-with-threadcount"):
     """
     Generates `Workflow` of two tasks
@@ -298,10 +287,9 @@ def gen_basic_wf_with_threadcount_concurrent(name="basic-wf-with-threadcount"):
     wf.add(fun_addtwo_with_threadcount(name="task1_1", a=wf.lzin.x, sgeThreads=4))
     wf.add(fun_addtwo_with_threadcount(name="task1_2", a=wf.lzin.x, sgeThreads=2))
     wf.add(fun_addvar(name="task2", a=wf.task1_1.lzout.out, b=2))
-    wf.set_output([("out1", wf.task2.lzout.out),
-        ("out2", wf.task1_2.lzout.out)
-    ])
+    wf.set_output([("out1", wf.task2.lzout.out), ("out2", wf.task1_2.lzout.out)])
     return wf
+
 
 @pytest.fixture(scope="function")
 def use_validator(request):
