@@ -431,7 +431,6 @@ class SGEWorker(DistributedWorker):
 
     def run_el(self, runnable, rerun=False):
         """Worker submission API."""
-        print("In run_el")
         (
             script_dir,
             batch_script,
@@ -440,11 +439,7 @@ class SGEWorker(DistributedWorker):
             threads_requested,
             output_dir,
         ) = self._prepare_runscripts(runnable, rerun=rerun)
-        print("after prepare_runscripts")
-        print("")
-        # self.threads_used += threads_requested
         if (script_dir / script_dir.parts[1]) == gettempdir():
-            print("Warning about temp directories")
             logger.warning("Temporary directories may not be shared across computers")
         if isinstance(runnable, TaskBase):
             cache_dir = runnable.cache_dir
@@ -545,7 +540,6 @@ class SGEWorker(DistributedWorker):
         output_dir,
         interpreter="/bin/sh",
     ):
-        # for threads_requested in self.tasks_to_run_by_threads_requested:
         if (
             len(self.tasks_to_run_by_threads_requested.get(threads_requested))
             <= self.max_job_array_length
@@ -631,7 +625,6 @@ class SGEWorker(DistributedWorker):
                 # Exception: Polling / job failure
                 # done = await self._poll_job(jobid)
                 if self.poll_for_result_file:
-                    print("Checking status of tasks")
                     if len(self.result_files_by_jobid[jobid]) > 0:
                         for task in list(self.result_files_by_jobid[jobid]):
                             if self.result_files_by_jobid[jobid][task].exists():
@@ -664,7 +657,6 @@ class SGEWorker(DistributedWorker):
                             #     print(e)
 
                     else:
-                        print("Checking for rerun after completion")
                         exit_status = await self._verify_exit_code(jobid)
                         if exit_status == "ERRORED":
                             jobid = await self._rerun_job_array(
@@ -674,7 +666,6 @@ class SGEWorker(DistributedWorker):
                             return True
 
                     if poll_counter == self.polls_before_checking_evicted:
-                        print("Periodic checking for rerun ")
                         exit_status = await self._verify_exit_code(jobid)
                         if exit_status == "ERRORED":
                             jobid = await self._rerun_job_array(
@@ -702,22 +693,27 @@ class SGEWorker(DistributedWorker):
     async def _rerun_job_array(
         self, cache_dir, uid, sargs, tasks_to_run, error_file, evicted_jobid
     ):
+        print(f"Rerunning array job: {evicted_jobid}")
         # # loading info about task with a specific uid
         for task_pkl, ind, rerun in tasks_to_run:
             task = load_task(task_pkl=task_pkl, ind=ind)
-            print(f"task.uid: {task.uid}")
-            printf(f"task.output_dir: {task.output_dir}")
-            printf(f"task.output_dir: {task.cache_locations}")
             info_file = cache_dir / f"{task.uid}_info.json"
             if info_file.exists():
                 checksum = json.loads(info_file.read_text())["checksum"]
-                print(f"checksum: {checksum}")
                 if (cache_dir / f"{checksum}.lock").exists():
+                    print(f'Unlinking lock file {cache_dir / f"{checksum}.lock"}')
                     # for pyt3.8 we could use missing_ok=True
-                    print(f"Unlinking {(cache_dir / f'{checksum}.lock')}")
                     (cache_dir / f"{checksum}.lock").unlink()
+                if (cache_dir / checksum / "_error.pklz").exists():
+                    print(f'Removing error file {cache_dir / checksum / "_error.pklz"}')
+                    (cache_dir / checksum / "_error.pklz").unlink()
+                    task._errored = False
+                    print(f"Setting {task}._errored to False")
                 else:
-                    print(f"checksum: {checksum} does not exist")
+                    print(
+                        f'Not removing error file {cache_dir / checksum / "_error.pklz"}'
+                    )
+
         # If the previous job array failed, run the array's script again and get the new jobid
         jobid = await self.submit_array_job(sargs, tasks_to_run, error_file)
         self.result_files_by_jobid[jobid] = self.result_files_by_jobid[evicted_jobid]
@@ -789,11 +785,6 @@ class SGEWorker(DistributedWorker):
             while True:
                 result_file = output_dir / "_result.pklz"
                 error_file = output_dir / "_error.pklz"
-                if error_file.exists():
-                    # printf(f'Removing {Path(cache_dir / f"{checksum}" / "_error.pklz")}')
-                    # Path(cache_dir / f"{checksum}" / "_error.pklz").unlink()
-                    # task = load_task(task_pkl=task_pkl, ind=ind)
-                    print(f"{error_file} exists. Consider removing and rerunning.")
                 if result_file.exists():
                     return True
                 await asyncio.sleep(self.poll_delay)
@@ -821,6 +812,10 @@ class SGEWorker(DistributedWorker):
     async def _verify_exit_code(self, jobid):
         cmd = (f"qacct", "-j", jobid)
         rc, stdout, stderr = await read_and_display_async(*cmd, hide_display=True)
+        if not stdout:
+            print("Did not find stdout on first exit code verification")
+            await asyncio.sleep(10)
+            rc, stdout, stderr = await read_and_display_async(*cmd, hide_display=True)
 
         # job is still pending/working
         if re.match(r"error: job id .* not found", stderr):
@@ -835,7 +830,8 @@ class SGEWorker(DistributedWorker):
             else:
                 stdout_dict[key_value[0]] = None
         if not stdout:
-            raise RuntimeError("Job information not found")
+            return "ERRORED"
+
         m = self._sacct_re.search(stdout)
         error_file = self.error[jobid]
         if [int(s) for s in stdout_dict["failed"].split() if s.isdigit()][0] == 0:
