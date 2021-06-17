@@ -693,6 +693,7 @@ class SGEWorker(DistributedWorker):
     async def _rerun_job_array(
         self, cache_dir, uid, sargs, tasks_to_run, error_file, evicted_jobid
     ):
+        print(f"Rerunning array job: {evicted_jobid}")
         # # loading info about task with a specific uid
         for task_pkl, ind, rerun in tasks_to_run:
             task = load_task(task_pkl=task_pkl, ind=ind)
@@ -700,8 +701,19 @@ class SGEWorker(DistributedWorker):
             if info_file.exists():
                 checksum = json.loads(info_file.read_text())["checksum"]
                 if (cache_dir / f"{checksum}.lock").exists():
+                    print(f'Unlinking lock file {cache_dir / f"{checksum}.lock"}')
                     # for pyt3.8 we could use missing_ok=True
                     (cache_dir / f"{checksum}.lock").unlink()
+                if (cache_dir / checksum / "_error.pklz").exists():
+                    print(f'Removing error file {cache_dir / checksum / "_error.pklz"}')
+                    (cache_dir / checksum / "_error.pklz").unlink()
+                    task._errored = False
+                    print(f"Setting {task}._errored to False")
+                else:
+                    print(
+                        f'Not removing error file {cache_dir / checksum / "_error.pklz"}'
+                    )
+
         # If the previous job array failed, run the array's script again and get the new jobid
         jobid = await self.submit_array_job(sargs, tasks_to_run, error_file)
         self.result_files_by_jobid[jobid] = self.result_files_by_jobid[evicted_jobid]
