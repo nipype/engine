@@ -530,6 +530,12 @@ class SGEWorker(DistributedWorker):
         )
         return tasks_to_run_copy
 
+    async def check_for_results_files(self, jobid, threads_requested):
+        for task in list(self.result_files_by_jobid[jobid]):
+            if self.result_files_by_jobid[jobid][task].exists():
+                del self.result_files_by_jobid[jobid][task]
+                self.threads_used -= threads_requested
+
     async def _submit_jobs(
         self,
         batchscript,
@@ -626,35 +632,38 @@ class SGEWorker(DistributedWorker):
                 # done = await self._poll_job(jobid)
                 if self.poll_for_result_file:
                     if len(self.result_files_by_jobid[jobid]) > 0:
-                        for task in list(self.result_files_by_jobid[jobid]):
-                            if self.result_files_by_jobid[jobid][task].exists():
-                                del self.result_files_by_jobid[jobid][task]
-                                self.threads_used -= threads_requested
+                        # for task in list(self.result_files_by_jobid[jobid]):
+                        #     if self.result_files_by_jobid[jobid][task].exists():
+                        #         del self.result_files_by_jobid[jobid][task]
+                        #         self.threads_used -= threads_requested
 
-                            # TODO: Periodically check for locked but empty directories and rerun the task
-                            # with the below, the task directory is removed but not its parent workflow directories
-                            # try:
-                            #     print(f"jobid: {jobid}")
-                            #     info_file = cache_dir / f"{task.uid}_info.json"
-                            #     if info_file.exists():
-                            #         checksum = json.loads(info_file.read_text())["checksum"]
-                            #         print(f"checksum: {checksum}")
-                            #         if (cache_dir / f"{checksum}.lock").exists() and any(Path(cache_dir / f"{checksum}").iterdir()):
-                            #             print(f"Path empty: {Path(cache_dir / f'{checksum}')}")
-                            #             # for pyt3.8 we could use missing_ok=True
-                            #             print(f"Unlinking {(cache_dir / f'{checksum}.lock')}")
-                            #             try:
-                            #                 print(f'unlinking {(cache_dir / f"{checksum}.lock")}')
-                            #                 (cache_dir / f"{checksum}.lock").unlink()
-                            #                 # printf(f'Removing {Path(cache_dir / f"{checksum}")}')
-                            #                 # Path(cache_dir / f"{checksum}").rmdir()
-                            #                 print(f"Restarting task: {task}")
-                            #                 task._run_task()
-                            #             except Exception as e:
-                            #                 print(e)
-                            #                 print("Couln't remove all files")
-                            # except Exception as e:
-                            #     print(e)
+                        await self.check_for_results_files(jobid, threads_requested)
+                        # Getting bogged down - try this and decreasing poll rate
+
+                        # TODO: Periodically check for locked but empty directories and rerun the task
+                        # with the below, the task directory is removed but not its parent workflow directories
+                        # try:
+                        #     print(f"jobid: {jobid}")
+                        #     info_file = cache_dir / f"{task.uid}_info.json"
+                        #     if info_file.exists():
+                        #         checksum = json.loads(info_file.read_text())["checksum"]
+                        #         print(f"checksum: {checksum}")
+                        #         if (cache_dir / f"{checksum}.lock").exists() and any(Path(cache_dir / f"{checksum}").iterdir()):
+                        #             print(f"Path empty: {Path(cache_dir / f'{checksum}')}")
+                        #             # for pyt3.8 we could use missing_ok=True
+                        #             print(f"Unlinking {(cache_dir / f'{checksum}.lock')}")
+                        #             try:
+                        #                 print(f'unlinking {(cache_dir / f"{checksum}.lock")}')
+                        #                 (cache_dir / f"{checksum}.lock").unlink()
+                        #                 # printf(f'Removing {Path(cache_dir / f"{checksum}")}')
+                        #                 # Path(cache_dir / f"{checksum}").rmdir()
+                        #                 print(f"Restarting task: {task}")
+                        #                 task._run_task()
+                        #             except Exception as e:
+                        #                 print(e)
+                        #                 print("Couln't remove all files")
+                        # except Exception as e:
+                        #     print(e)
 
                     else:
                         exit_status = await self._verify_exit_code(jobid)
@@ -664,8 +673,13 @@ class SGEWorker(DistributedWorker):
                             )
                         else:
                             return True
+                        # return True # I think this resulted in _error files indicating missing output but then the output showing up later (AntsRegistration3)
 
-                    if poll_counter == self.polls_before_checking_evicted:
+                    print(f"jobid {jobid}, poll_counter={poll_counter}")
+                    if poll_counter >= self.polls_before_checking_evicted:
+                        print(
+                            f"Checking for evicted for jobid {jobid}, poll_counter={poll_counter}"
+                        )
                         exit_status = await self._verify_exit_code(jobid)
                         if exit_status == "ERRORED":
                             jobid = await self._rerun_job_array(
@@ -705,14 +719,26 @@ class SGEWorker(DistributedWorker):
                     # for pyt3.8 we could use missing_ok=True
                     (cache_dir / f"{checksum}.lock").unlink()
                 if (cache_dir / checksum / "_error.pklz").exists():
-                    print(f'Removing error file {cache_dir / checksum / "_error.pklz"}')
-                    (cache_dir / checksum / "_error.pklz").unlink()
-                    task._errored = False
-                    print(f"Setting {task}._errored to False")
+                    print(f'Error file {cache_dir / checksum / "_error.pklz"} exists')
                 else:
                     print(
-                        f'Not removing error file {cache_dir / checksum / "_error.pklz"}'
+                        f'Error file {cache_dir / checksum / "_error.pklz"} does not exist'
                     )
+                if (cache_dir / checksum / "_result.pklz").exists():
+                    print(f'Error file {cache_dir / checksum / "_result.pklz"} exists')
+                else:
+                    print(
+                        f'Error file {cache_dir / checksum / "_result.pklz"} does not exist'
+                    )
+
+                #     print(f'Removing error file {cache_dir / checksum / "_error.pklz"}')
+                #     (cache_dir / checksum / "_error.pklz").unlink()
+                #     task._errored = False
+                #     print(f"Setting {task}._errored to False")
+                # else:
+                #     print(
+                #         f'Not removing error file {cache_dir / checksum / "_error.pklz"}'
+                #     )
 
         # If the previous job array failed, run the array's script again and get the new jobid
         jobid = await self.submit_array_job(sargs, tasks_to_run, error_file)
@@ -785,7 +811,7 @@ class SGEWorker(DistributedWorker):
             while True:
                 result_file = output_dir / "_result.pklz"
                 error_file = output_dir / "_error.pklz"
-                if result_file.exists():
+                if result_file.exists():  # TODO check this works
                     return True
                 await asyncio.sleep(self.poll_delay)
         else:
@@ -813,7 +839,7 @@ class SGEWorker(DistributedWorker):
         cmd = (f"qacct", "-j", jobid)
         rc, stdout, stderr = await read_and_display_async(*cmd, hide_display=True)
         if not stdout:
-            print("Did not find stdout on first exit code verification")
+            # print("Did not find stdout on first exit code verification")
             await asyncio.sleep(10)
             rc, stdout, stderr = await read_and_display_async(*cmd, hide_display=True)
 
@@ -821,23 +847,20 @@ class SGEWorker(DistributedWorker):
         if re.match(r"error: job id .* not found", stderr):
             return False
 
-        # Read the qacct stdout into dictionary stdout_dict
-        stdout_dict = {}
-        for line in stdout.splitlines():
-            key_value = line.split(None, 1)
-            if len(key_value) > 1:
-                stdout_dict[key_value[0]] = key_value[1]
-            else:
-                stdout_dict[key_value[0]] = None
         if not stdout:
+            print("Still did not find stdout - error")
             return "ERRORED"
 
-        m = self._sacct_re.search(stdout)
-        error_file = self.error[jobid]
-        if [int(s) for s in stdout_dict["failed"].split() if s.isdigit()][0] == 0:
-            return True
-        else:
-            return "ERRORED"  # SGE job failed
+        # Read the qacct stdout into dictionary stdout_dict
+        for line in stdout.splitlines():
+            line_split = line.split()
+            # print(f"line_split: {line_split}")
+            if len(line_split) > 1:
+                if line_split[0] == "failed":
+                    if line_split[1].isdigit() and int(line_split[1]) == 100:
+                        print(f"failed for {jobid} is `{int(line_split[1])}`")
+                        return "ERRORED"
+
         return True
 
 
