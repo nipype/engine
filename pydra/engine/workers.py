@@ -428,6 +428,7 @@ class SGEWorker(DistributedWorker):
         self.polls_before_checking_evicted = polls_before_checking_evicted
         self.result_files_by_jobid = {}
         self.collect_jobs_delay = collect_jobs_delay
+        self.task_pkls_rerun = {}
 
     def run_el(self, runnable, rerun=False):
         """Worker submission API."""
@@ -632,12 +633,12 @@ class SGEWorker(DistributedWorker):
                 # done = await self._poll_job(jobid)
                 if self.poll_for_result_file:
                     if len(self.result_files_by_jobid[jobid]) > 0:
-                        # for task in list(self.result_files_by_jobid[jobid]):
-                        #     if self.result_files_by_jobid[jobid][task].exists():
-                        #         del self.result_files_by_jobid[jobid][task]
-                        #         self.threads_used -= threads_requested
+                        for task in list(self.result_files_by_jobid[jobid]):
+                            if self.result_files_by_jobid[jobid][task].exists():
+                                del self.result_files_by_jobid[jobid][task]
+                                self.threads_used -= threads_requested
 
-                        await self.check_for_results_files(jobid, threads_requested)
+                        # await self.check_for_results_files(jobid, threads_requested)
                         # Getting bogged down - try this and decreasing poll rate
 
                         # TODO: Periodically check for locked but empty directories and rerun the task
@@ -668,10 +669,19 @@ class SGEWorker(DistributedWorker):
                     else:
                         exit_status = await self._verify_exit_code(jobid)
                         if exit_status == "ERRORED":
+                            print(
+                                f"Got errored after all _results files showed up {jobid}"
+                            )
                             jobid = await self._rerun_job_array(
                                 cache_dir, uid, sargs, tasks_to_run, error_file, jobid
                             )
                         else:
+                            for task_pkl, ind, rerun in tasks_to_run:
+                                if task_pkl in self.task_pkls_rerun:
+                                    del self.task_pkls_rerun[task_pkl]
+                                    print(
+                                        f"self.task_pkls_rerun: {self.task_pkls_rerun}"
+                                    )
                             return True
                         # return True # I think this resulted in _error files indicating missing output but then the output showing up later (AntsRegistration3)
 
@@ -707,10 +717,17 @@ class SGEWorker(DistributedWorker):
     async def _rerun_job_array(
         self, cache_dir, uid, sargs, tasks_to_run, error_file, evicted_jobid
     ):
+        # print(f"Ensuring job evicted")
+        # cmd = (f"qdel", evicted_jobid)
+        # rc, stdout, stderr = await read_and_display_async(*cmd, hide_display=True)
+        # print(f"Evicted {evicted_jobid}, rc={rc}, stdout={stdout}, stderr={stderr}")
         print(f"Rerunning array job: {evicted_jobid}")
-        # # loading info about task with a specific uid
+        # loading info about task with a specific uid
+        # tasks_to_rerun = []
         for task_pkl, ind, rerun in tasks_to_run:
             task = load_task(task_pkl=task_pkl, ind=ind)
+            # self.task_pkls_rerun[task.output_dir / "_task.pklz"] = None
+            self.task_pkls_rerun[task_pkl] = None
             info_file = cache_dir / f"{task.uid}_info.json"
             if info_file.exists():
                 checksum = json.loads(info_file.read_text())["checksum"]
@@ -718,6 +735,7 @@ class SGEWorker(DistributedWorker):
                     print(f'Unlinking lock file {cache_dir / f"{checksum}.lock"}')
                     # for pyt3.8 we could use missing_ok=True
                     (cache_dir / f"{checksum}.lock").unlink()
+                # Maybe wait a little to check if _error.pklz exists - not getting found immediately
                 if (cache_dir / checksum / "_error.pklz").exists():
                     print(f'Error file {cache_dir / checksum / "_error.pklz"} exists')
                 else:
@@ -730,18 +748,37 @@ class SGEWorker(DistributedWorker):
                     print(
                         f'Error file {cache_dir / checksum / "_result.pklz"} does not exist'
                     )
+            # if task._errored:
+            # print(f"Setting task_rerun for {task_pkl}")
+            # print(f"task.task_rerun before: {task.task_rerun}")
+            # task.task_rerun = True
+            # print(f"task.task_rerun after: {task.task_rerun}")
+            # else:
+            #     print(f"Not setting rerun for {task_pkl} because it is not errored")
+            # print(f"task._errored before: {task._errored}")
+            # task._errored = False
+            # print(f"task._errored after: {task._errored}")
+            # print(f"task._result before: {task._result}")
+            # task._result = False
+            # print(f"task._result after: {task._result}")
+            # print(f"task._done before: {task._done}")
+            # task._done = False
+            # print(f"task._done after: {task._done}")
 
-                #     print(f'Removing error file {cache_dir / checksum / "_error.pklz"}')
-                #     (cache_dir / checksum / "_error.pklz").unlink()
-                #     task._errored = False
-                #     print(f"Setting {task}._errored to False")
-                # else:
-                #     print(
-                #         f'Not removing error file {cache_dir / checksum / "_error.pklz"}'
-                #     )
+            # tasks_to_rerun.append((task.pickle_task(), ind, True))
+
+            #     print(f'Removing error file {cache_dir / checksum / "_error.pklz"}')
+            #     (cache_dir / checksum / "_error.pklz").unlink()
+            #     task._errored = False
+            #     print(f"Setting {task}._errored to False")
+            # else:
+            #     print(
+            #         f'Not removing error file {cache_dir / checksum / "_error.pklz"}'
+            #     )
 
         # If the previous job array failed, run the array's script again and get the new jobid
         jobid = await self.submit_array_job(sargs, tasks_to_run, error_file)
+        # jobid = await self.submit_array_job(sargs, tasks_to_rerun, error_file)
         self.result_files_by_jobid[jobid] = self.result_files_by_jobid[evicted_jobid]
         return jobid
 
@@ -811,8 +848,16 @@ class SGEWorker(DistributedWorker):
             while True:
                 result_file = output_dir / "_result.pklz"
                 error_file = output_dir / "_error.pklz"
-                if result_file.exists():  # TODO check this works
+                if result_file.exists() and str(task_pkl) not in self.task_pkls_rerun:
+                    task = load_task(task_pkl=task_pkl, ind=ind)
+                    print(f"Returning true for {task_pkl}")
+                    print(f"task not errored")
                     return True
+                    # if not self.rerun_errored or not task._errored:
+                    #     print(f"{str(task_pkl)} not in {self.task_pkls_rerun}")
+                    #     print(f"Returning true for {task_pkl}")
+                    #     print(f"task not errored")
+                    #     return True
                 await asyncio.sleep(self.poll_delay)
         else:
             rc, stdout, stderr = await self.get_output_by_task_pkl(task_pkl)
@@ -860,6 +905,10 @@ class SGEWorker(DistributedWorker):
                     if line_split[1].isdigit() and int(line_split[1]) == 100:
                         print(f"failed for {jobid} is `{int(line_split[1])}`")
                         return "ERRORED"
+                # if self.rerun_errored and line_split[0] == "exit_status":
+                #     if line_split[1].isdigit() and int(line_split[1]) != 0:
+                #         print(f"exit_status not 0 for {jobid} (was {int(line_split[1])}")
+                #         return "ERRORED"
 
         return True
 
