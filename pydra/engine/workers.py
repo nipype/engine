@@ -594,6 +594,9 @@ class SGEWorker(DistributedWorker):
                 sargs.append("-N")
                 sargs.append(jobname)
             output = re.search(r"(?<=-o )\S+", self.qsub_args)
+            sargs.append("-l")
+            # sargs.append(f"h_vmem=10G")
+            sargs.append(f"mem_free={40*len(tasks_to_run)}G")
             sargs.append("-pe")
             sargs.append("smp")
             sargs.append(f"{threads_requested}")
@@ -725,29 +728,25 @@ class SGEWorker(DistributedWorker):
         # loading info about task with a specific uid
         # tasks_to_rerun = []
         for task_pkl, ind, rerun in tasks_to_run:
-            task = load_task(task_pkl=task_pkl, ind=ind)
-            # self.task_pkls_rerun[task.output_dir / "_task.pklz"] = None
-            self.task_pkls_rerun[task_pkl] = None
-            info_file = cache_dir / f"{task.uid}_info.json"
-            if info_file.exists():
-                checksum = json.loads(info_file.read_text())["checksum"]
-                if (cache_dir / f"{checksum}.lock").exists():
-                    print(f'Unlinking lock file {cache_dir / f"{checksum}.lock"}')
-                    # for pyt3.8 we could use missing_ok=True
-                    (cache_dir / f"{checksum}.lock").unlink()
-                # Maybe wait a little to check if _error.pklz exists - not getting found immediately
-                if (cache_dir / checksum / "_error.pklz").exists():
-                    print(f'Error file {cache_dir / checksum / "_error.pklz"} exists')
-                else:
-                    print(
-                        f'Error file {cache_dir / checksum / "_error.pklz"} does not exist'
-                    )
-                if (cache_dir / checksum / "_result.pklz").exists():
-                    print(f'Error file {cache_dir / checksum / "_result.pklz"} exists')
-                else:
-                    print(
-                        f'Error file {cache_dir / checksum / "_result.pklz"} does not exist'
-                    )
+            sge_task = load_task(task_pkl=task_pkl, ind=ind)
+            application_task_pkl = sge_task.output_dir / "_task.pklz"
+            if (
+                not application_task_pkl.exists()
+                or load_task(task_pkl=application_task_pkl).result() is None
+                or load_task(task_pkl=application_task_pkl).result().errored
+            ):
+                self.task_pkls_rerun[task_pkl] = None
+                info_file = cache_dir / f"{sge_task.uid}_info.json"
+                if info_file.exists():
+                    checksum = json.loads(info_file.read_text())["checksum"]
+                    if (cache_dir / f"{checksum}.lock").exists():
+                        print(f'Unlinking lock file {cache_dir / f"{checksum}.lock"}')
+                        # for pyt3.8 we could use missing_ok=True
+                        (cache_dir / f"{checksum}.lock").unlink()
+                    # Maybe wait a little to check if _error.pklz exists - not getting found immediately
+            else:
+                print(f"task {application_task_pkl} does not need rerunning")
+
             # if task._errored:
             # print(f"Setting task_rerun for {task_pkl}")
             # print(f"task.task_rerun before: {task.task_rerun}")
@@ -853,11 +852,6 @@ class SGEWorker(DistributedWorker):
                     print(f"Returning true for {task_pkl}")
                     print(f"task not errored")
                     return True
-                    # if not self.rerun_errored or not task._errored:
-                    #     print(f"{str(task_pkl)} not in {self.task_pkls_rerun}")
-                    #     print(f"Returning true for {task_pkl}")
-                    #     print(f"task not errored")
-                    #     return True
                 await asyncio.sleep(self.poll_delay)
         else:
             rc, stdout, stderr = await self.get_output_by_task_pkl(task_pkl)
@@ -881,6 +875,7 @@ class SGEWorker(DistributedWorker):
         return False
 
     async def _verify_exit_code(self, jobid):
+        print(f"Verifying exit code for {jobid}")
         cmd = (f"qacct", "-j", jobid)
         rc, stdout, stderr = await read_and_display_async(*cmd, hide_display=True)
         if not stdout:
@@ -899,17 +894,16 @@ class SGEWorker(DistributedWorker):
         # Read the qacct stdout into dictionary stdout_dict
         for line in stdout.splitlines():
             line_split = line.split()
-            # print(f"line_split: {line_split}")
             if len(line_split) > 1:
                 if line_split[0] == "failed":
-                    if line_split[1].isdigit() and int(line_split[1]) == 100:
+                    if not line_split[1].isdigit():
+                        return "ERRORED"
+                    elif not int(line_split[1]) == 0:
                         print(f"failed for {jobid} is `{int(line_split[1])}`")
                         return "ERRORED"
-                # if self.rerun_errored and line_split[0] == "exit_status":
-                #     if line_split[1].isdigit() and int(line_split[1]) != 0:
-                #         print(f"exit_status not 0 for {jobid} (was {int(line_split[1])}")
-                #         return "ERRORED"
-
+                    else:
+                        print(f"line_split[1]: `{line_split[1]}`")
+        print(f"Exit code for {jobid} success")
         return True
 
 
