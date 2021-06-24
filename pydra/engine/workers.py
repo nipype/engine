@@ -4,14 +4,22 @@ import sys, os, json
 import re
 from tempfile import gettempdir
 from pathlib import Path
-from shutil import copyfile
+from shutil import copyfile, which
 
 import concurrent.futures as cf
 
 from .core import TaskBase
-from .helpers import get_available_cpus, read_and_display_async, save, load_and_run
+from .helpers import (
+    get_available_cpus,
+    read_and_display_async,
+    save,
+    load_and_run,
+    load_task,
+)
 
 import logging
+
+import random
 
 logger = logging.getLogger("pydra.worker")
 
@@ -265,11 +273,9 @@ class SlurmWorker(DistributedWorker):
         output = re.search(r"(?<=-o )\S+|(?<=--output=)\S+", self.sbatch_args)
         if not output:
             output_file = str(script_dir / "slurm-%j.out")
-            sargs.append(f"--output={output_file}")
         error = re.search(r"(?<=-e )\S+|(?<=--error=)\S+", self.sbatch_args)
         if not error:
             error_file = str(script_dir / "slurm-%j.err")
-            sargs.append(f"--error={error_file}")
         else:
             error_file = None
         sargs.append(str(batchscript))
@@ -343,6 +349,518 @@ class SlurmWorker(DistributedWorker):
             else:
                 error_message = "Job failed (unknown reason - TODO)"
             raise Exception(error_message)
+        return True
+
+
+class SGEWorker(DistributedWorker):
+    """A worker to execute tasks on SLURM systems."""
+
+    _cmd = "qsub"
+    _sacct_re = re.compile(
+        "(?P<jobid>\\d*) +(?P<status>\\w*)\\+? +" "(?P<exit_code>\\d+):\\d+"
+    )
+
+    def __init__(
+        self,
+        loop=None,
+        max_jobs=None,
+        poll_delay=1,
+        qsub_args=None,
+        write_output_files=True,
+        max_job_array_length=50,
+        indirect_submit_host=None,
+        max_threads=None,
+        poll_for_result_file=True,
+        default_threads_per_task=1,
+        polls_before_checking_evicted=60,
+        collect_jobs_delay=30,
+    ):
+        """
+        Initialize SGE Worker.
+
+        Parameters
+        ----------
+        poll_delay : seconds
+            Delay between polls to slurmd
+        qsub_args : str
+            Additional qsub arguments
+        max_jobs : int
+            Maximum number of submitted jobs
+        write_output_files : bool
+            Turns on/off writing to output files for individual tasks
+        max_job_array_length : int
+            Number of jobs an SGE job array can hold
+        indirect_submit_host : str
+            Name of a submit node in the SGE cluster through which to run SGE qsub commands
+        max_threads : int
+            Maximum number of threads that will be scheduled for SGE submission at once
+        poll_for_result_file : bool
+            If true, a task is complete when its _result.pklz file exists
+            If false, a task is complete when its job array is indicated complete by qstat/qacct polling
+        default_threads_per_task : int
+            Sets the number of slots SGE should request for a task if sgeThreads
+            is not a field in the task input_spec
+        polls_before_checking_evicted : int
+            Number of poll_delays before running qacct to check if a task has been evicted by SGE
+        collect_jobs_delay : int
+            Number of seconds to wait for the list of jobs for a job array to fill
+
+        """
+        super().__init__(loop=loop, max_jobs=max_jobs)
+        if not poll_delay or poll_delay < 0:
+            poll_delay = 0
+        self.poll_delay = poll_delay
+        self.qsub_args = qsub_args or ""
+        self.error = {}
+        self.write_output_files = (
+            write_output_files  # set to False to avoid OSError: Too many open files
+        )
+        self.tasks_to_run_by_threads_requested = {}
+        self.output_by_jobid = {}
+        self.jobid_by_task_uid = {}
+        self.max_job_array_length = max_job_array_length
+        self.threads_used = 0
+        self.job_completed_by_jobid = {}
+        self.indirect_submit_host = indirect_submit_host
+        self.max_threads = max_threads
+        self.default_threads_per_task = default_threads_per_task
+        self.poll_for_result_file = poll_for_result_file
+        self.polls_before_checking_evicted = polls_before_checking_evicted
+        self.result_files_by_jobid = {}
+        self.collect_jobs_delay = collect_jobs_delay
+
+    def run_el(self, runnable, rerun=False):
+        """Worker submission API."""
+        (
+            script_dir,
+            batch_script,
+            task_pkl,
+            ind,
+            threads_requested,
+            output_dir,
+        ) = self._prepare_runscripts(runnable, rerun=rerun)
+        if (script_dir / script_dir.parts[1]) == gettempdir():
+            logger.warning("Temporary directories may not be shared across computers")
+        if isinstance(runnable, TaskBase):
+            cache_dir = runnable.cache_dir
+            name = runnable.name
+            uid = runnable.uid
+        else:  # runnable is a tuple (ind, pkl file, task)
+            cache_dir = runnable[-1].cache_dir
+            name = runnable[-1].name
+            uid = f"{runnable[-1].uid}_{runnable[0]}"
+
+        return self._submit_job(
+            batch_script,
+            name=name,
+            uid=uid,
+            cache_dir=cache_dir,
+            task_pkl=task_pkl,
+            ind=ind,
+            threads_requested=threads_requested,
+            output_dir=output_dir,
+        )
+
+    def _prepare_runscripts(self, task, interpreter="/bin/sh", rerun=False):
+        if isinstance(task, TaskBase):
+            cache_dir = task.cache_dir
+            ind = None
+            uid = task.uid
+        else:
+            ind = task[0]
+            cache_dir = task[-1].cache_dir
+            uid = f"{task[-1].uid}_{ind}"
+
+        script_dir = cache_dir / f"{self.__class__.__name__}_scripts" / uid
+        script_dir.mkdir(parents=True, exist_ok=True)
+        if ind is None:
+            if not (script_dir / "_task.pkl").exists():
+                save(script_dir, task=task)
+        else:
+            copyfile(task[1], script_dir / "_task.pklz")
+
+        task_pkl = script_dir / "_task.pklz"
+        if not task_pkl.exists() or not task_pkl.stat().st_size:
+            raise Exception("Missing or empty task!")
+
+        batchscript = script_dir / f"batchscript_{uid}.job"
+
+        # Set the threads_requested if given in the task input_spec - otherwise set to the default
+        try:
+            threads_requested = task[-1].inputs.sgeThreads
+        except:
+            try:
+                threads_requested = task.inputs.sgeThreads
+            except:
+                try:
+                    # itk variable for threads is num_threads - check if that has been set
+                    threads_requested = task[-1].inputs.num_threads
+                except:
+                    try:
+                        threads_requested = task.inputs.num_threads
+                    except:
+                        threads_requested = self.default_threads_per_task
+        if not isinstance(threads_requested, int):
+            threads_requested = self.default_threads_per_task
+
+        if threads_requested not in self.tasks_to_run_by_threads_requested:
+            self.tasks_to_run_by_threads_requested[threads_requested] = []
+        self.tasks_to_run_by_threads_requested[threads_requested].append(
+            (str(task_pkl), ind, rerun)
+        )
+
+        return (
+            script_dir,
+            batchscript,
+            task_pkl,
+            ind,
+            threads_requested,
+            task.output_dir,
+        )
+
+    async def get_tasks_to_run(self, threads_requested):
+        # Extract the first N tasks to run
+        tasks_to_run_copy, self.tasks_to_run_by_threads_requested[threads_requested] = (
+            self.tasks_to_run_by_threads_requested[threads_requested][
+                : self.max_job_array_length
+            ],
+            self.tasks_to_run_by_threads_requested[threads_requested][
+                self.max_job_array_length :
+            ],
+        )
+        return tasks_to_run_copy
+
+    async def check_for_results_files(self, jobid, threads_requested):
+        for task in list(self.result_files_by_jobid[jobid]):
+            if self.result_files_by_jobid[jobid][task].exists():
+                del self.result_files_by_jobid[jobid][task]
+                self.threads_used -= threads_requested
+
+    async def _submit_jobs(
+        self,
+        batchscript,
+        name,
+        uid,
+        cache_dir,
+        threads_requested,
+        output_dir,
+        interpreter="/bin/sh",
+    ):
+        if (
+            len(self.tasks_to_run_by_threads_requested.get(threads_requested))
+            <= self.max_job_array_length
+        ):
+            await asyncio.sleep(self.collect_jobs_delay)
+        tasks_to_run = await self.get_tasks_to_run(threads_requested)
+
+        if len(tasks_to_run) > 0:
+            if self.max_threads is not None:
+                while self.threads_used > self.max_threads - threads_requested * len(
+                    tasks_to_run
+                ):
+                    await asyncio.sleep(self.poll_delay)
+            self.threads_used += threads_requested * len(tasks_to_run)
+
+            python_string = f"""import sys; from pydra.engine.helpers import load_and_run; task_pkls={[task_tuple for task_tuple in tasks_to_run]}; task_index=int(sys.argv[1])-1; load_and_run(task_pkl=task_pkls[task_index][0], ind=task_pkls[task_index][1], rerun=task_pkls[task_index][2])"""
+            bcmd_job = "\n".join(
+                (
+                    f"#!{interpreter}",
+                    f"{sys.executable} {Path(batchscript).with_suffix('.py')}"
+                    + " $SGE_TASK_ID",
+                )
+            )
+
+            bcmd_py = python_string
+
+            # Better runtime when the python contents are written to file
+            # rather than given by cmdline arg -c
+            with Path(batchscript).with_suffix(".py").open("wt") as fp:
+                fp.write(bcmd_py)
+
+            with batchscript.open("wt") as fp:
+                fp.writelines(bcmd_job)
+
+            script_dir = cache_dir / f"{self.__class__.__name__}_scripts" / uid
+            script_dir.mkdir(parents=True, exist_ok=True)
+            sargs = ["-t"]
+            sargs.append(f"1-{len(tasks_to_run)}")
+            sargs = sargs + self.qsub_args.split()
+
+            jobname = re.search(r"(?<=-N )\S+", self.qsub_args)
+
+            if not jobname:
+                jobname = ".".join((name, uid))
+                sargs.append("-N")
+                sargs.append(jobname)
+            output = re.search(r"(?<=-o )\S+", self.qsub_args)
+            sargs.append("-pe")
+            sargs.append("smp")
+            sargs.append(f"{threads_requested}")
+            if not output:
+                output_file = str(script_dir / "sge-%j.out")
+                if self.write_output_files:
+                    sargs.append("-o")
+                    sargs.append(output_file)
+            error = re.search(r"(?<=-e )\S+", self.qsub_args)
+            if not error:
+                error_file = str(script_dir / "sge-%j.out")
+                if self.write_output_files:
+                    sargs.append("-e")
+                    sargs.append(error_file)
+            else:
+                error_file = None
+            sargs.append(str(batchscript))
+
+            await asyncio.sleep(random.uniform(0, 5))
+
+            jobid = await self.submit_array_job(sargs, tasks_to_run, error_file)
+
+            if self.poll_for_result_file:
+                self.result_files_by_jobid[jobid] = {}
+                for task_pkl, ind, rerun in tasks_to_run:
+                    task = load_task(task_pkl=task_pkl, ind=ind)
+                    self.result_files_by_jobid[jobid][task] = (
+                        task.output_dir / "_result.pklz"
+                    )
+
+            poll_counter = 0
+            while True:
+                # 3 possibilities
+                # False: job is still pending/working
+                # True: job is complete
+                # Exception: Polling / job failure
+                # done = await self._poll_job(jobid)
+                if self.poll_for_result_file:
+                    if len(self.result_files_by_jobid[jobid]) > 0:
+                        # for task in list(self.result_files_by_jobid[jobid]):
+                        #     if self.result_files_by_jobid[jobid][task].exists():
+                        #         del self.result_files_by_jobid[jobid][task]
+                        #         self.threads_used -= threads_requested
+
+                        await self.check_for_results_files(jobid, threads_requested)
+                        # Getting bogged down - try this and decreasing poll rate
+
+                        # TODO: Periodically check for locked but empty directories and rerun the task
+                        # with the below, the task directory is removed but not its parent workflow directories
+                        # try:
+                        #     print(f"jobid: {jobid}")
+                        #     info_file = cache_dir / f"{task.uid}_info.json"
+                        #     if info_file.exists():
+                        #         checksum = json.loads(info_file.read_text())["checksum"]
+                        #         print(f"checksum: {checksum}")
+                        #         if (cache_dir / f"{checksum}.lock").exists() and any(Path(cache_dir / f"{checksum}").iterdir()):
+                        #             print(f"Path empty: {Path(cache_dir / f'{checksum}')}")
+                        #             # for pyt3.8 we could use missing_ok=True
+                        #             print(f"Unlinking {(cache_dir / f'{checksum}.lock')}")
+                        #             try:
+                        #                 print(f'unlinking {(cache_dir / f"{checksum}.lock")}')
+                        #                 (cache_dir / f"{checksum}.lock").unlink()
+                        #                 # printf(f'Removing {Path(cache_dir / f"{checksum}")}')
+                        #                 # Path(cache_dir / f"{checksum}").rmdir()
+                        #                 print(f"Restarting task: {task}")
+                        #                 task._run_task()
+                        #             except Exception as e:
+                        #                 print(e)
+                        #                 print("Couln't remove all files")
+                        # except Exception as e:
+                        #     print(e)
+
+                    else:
+                        exit_status = await self._verify_exit_code(jobid)
+                        if exit_status == "ERRORED":
+                            jobid = await self._rerun_job_array(
+                                cache_dir, uid, sargs, tasks_to_run, error_file, jobid
+                            )
+                        else:
+                            return True
+                        # return True # I think this resulted in _error files indicating missing output but then the output showing up later (AntsRegistration3)
+
+                    print(f"jobid {jobid}, poll_counter={poll_counter}")
+                    if poll_counter >= self.polls_before_checking_evicted:
+                        print(
+                            f"Checking for evicted for jobid {jobid}, poll_counter={poll_counter}"
+                        )
+                        exit_status = await self._verify_exit_code(jobid)
+                        if exit_status == "ERRORED":
+                            jobid = await self._rerun_job_array(
+                                cache_dir, uid, sargs, tasks_to_run, error_file, jobid
+                            )
+                        poll_counter = 0
+                    poll_counter += 1
+                    await asyncio.sleep(self.poll_delay)
+                else:
+                    done = await self._poll_job(jobid, cache_dir)
+                    if done:
+                        if done == "ERRORED":  # If the SGE job was evicted, rerun it
+                            jobid = await self._rerun_job_array(
+                                cache_dir, uid, sargs, tasks_to_run, error_file, jobid
+                            )
+                        else:
+                            self.job_completed_by_jobid[jobid] = True
+                            self.threads_used -= threads_requested * len(tasks_to_run)
+                            return True
+                    # Don't poll exactly on the same interval to avoid overloading SGE
+                    await asyncio.sleep(
+                        random.uniform(max(0, self.poll_delay - 2), self.poll_delay + 2)
+                    )
+
+    async def _rerun_job_array(
+        self, cache_dir, uid, sargs, tasks_to_run, error_file, evicted_jobid
+    ):
+        print(f"Rerunning array job: {evicted_jobid}")
+        # # loading info about task with a specific uid
+        for task_pkl, ind, rerun in tasks_to_run:
+            task = load_task(task_pkl=task_pkl, ind=ind)
+            info_file = cache_dir / f"{task.uid}_info.json"
+            if info_file.exists():
+                checksum = json.loads(info_file.read_text())["checksum"]
+                if (cache_dir / f"{checksum}.lock").exists():
+                    print(f'Unlinking lock file {cache_dir / f"{checksum}.lock"}')
+                    # for pyt3.8 we could use missing_ok=True
+                    (cache_dir / f"{checksum}.lock").unlink()
+                if (cache_dir / checksum / "_error.pklz").exists():
+                    print(f'Error file {cache_dir / checksum / "_error.pklz"} exists')
+                else:
+                    print(
+                        f'Error file {cache_dir / checksum / "_error.pklz"} does not exist'
+                    )
+                if (cache_dir / checksum / "_result.pklz").exists():
+                    print(f'Error file {cache_dir / checksum / "_result.pklz"} exists')
+                else:
+                    print(
+                        f'Error file {cache_dir / checksum / "_result.pklz"} does not exist'
+                    )
+
+                #     print(f'Removing error file {cache_dir / checksum / "_error.pklz"}')
+                #     (cache_dir / checksum / "_error.pklz").unlink()
+                #     task._errored = False
+                #     print(f"Setting {task}._errored to False")
+                # else:
+                #     print(
+                #         f'Not removing error file {cache_dir / checksum / "_error.pklz"}'
+                #     )
+
+        # If the previous job array failed, run the array's script again and get the new jobid
+        jobid = await self.submit_array_job(sargs, tasks_to_run, error_file)
+        self.result_files_by_jobid[jobid] = self.result_files_by_jobid[evicted_jobid]
+        return jobid
+
+    async def submit_array_job(self, sargs, tasks_to_run, error_file):
+        if self.indirect_submit_host is not None:
+            indirect_submit_host_prefix = []
+            indirect_submit_host_prefix.append("ssh")
+            indirect_submit_host_prefix.append(self.indirect_submit_host)
+            indirect_submit_host_prefix.append('""export SGE_ROOT=/opt/sge;')
+            rc, stdout, stderr = await read_and_display_async(
+                *indirect_submit_host_prefix,
+                str(Path(which("qsub")).parent / "qsub"),
+                *sargs,
+                '""',
+                hide_display=True,
+            )
+        else:
+            rc, stdout, stderr = await read_and_display_async(
+                "qsub", *sargs, hide_display=True
+            )
+        jobid = re.search(r"\d+", stdout)
+        if rc:
+            raise RuntimeError(f"Error returned from qsub: {stderr}")
+        elif not jobid:
+            raise RuntimeError("Could not extract job ID")
+        jobid = jobid.group()
+        self.output_by_jobid[jobid] = (rc, stdout, stderr)
+
+        for task_pkl, ind, rerun in tasks_to_run:
+
+            self.jobid_by_task_uid[Path(task_pkl).parent.name] = jobid
+
+        if error_file:
+            error_file = str(error_file).replace("%j", jobid)
+        self.error[jobid] = str(error_file).replace("%j", jobid)
+        return jobid
+
+    async def get_output_by_task_pkl(self, task_pkl):
+        jobid = self.jobid_by_task_uid.get(task_pkl.parent.name)
+        while jobid == None:
+            jobid = self.jobid_by_task_uid.get(task_pkl.parent.name)
+            await asyncio.sleep(1)
+        job_output = self.output_by_jobid.get(jobid)
+        while job_output == None:
+            job_output = self.output_by_jobid.get(jobid)
+            await asyncio.sleep(1)
+        return job_output
+
+    async def _submit_job(
+        self,
+        batchscript,
+        name,
+        uid,
+        cache_dir,
+        task_pkl,
+        ind,
+        threads_requested,
+        output_dir,
+    ):
+        """Coroutine that submits task runscript and polls job until completion or error."""
+        await self._submit_jobs(
+            batchscript, name, uid, cache_dir, threads_requested, output_dir
+        )
+        jobname = ".".join((name, uid))
+
+        if self.poll_for_result_file:
+            while True:
+                result_file = output_dir / "_result.pklz"
+                error_file = output_dir / "_error.pklz"
+                if result_file.exists():  # TODO check this works
+                    return True
+                await asyncio.sleep(self.poll_delay)
+        else:
+            rc, stdout, stderr = await self.get_output_by_task_pkl(task_pkl)
+            while True:
+                jobid = self.jobid_by_task_uid.get(task_pkl.parent.name)
+                if self.job_completed_by_jobid.get(jobid) == True:
+                    return True
+                else:
+                    await asyncio.sleep(self.poll_delay)
+
+    async def _poll_job(self, jobid, cache_dir):
+
+        cmd = (f"qstat", "-j", jobid)
+        logger.debug(f"Polling job {jobid}")
+        rc, stdout, stderr = await read_and_display_async(*cmd, hide_display=True)
+
+        if not stdout:
+            # job is no longer running - check exit code
+            status = await self._verify_exit_code(jobid)
+            return status
+        return False
+
+    async def _verify_exit_code(self, jobid):
+        cmd = (f"qacct", "-j", jobid)
+        rc, stdout, stderr = await read_and_display_async(*cmd, hide_display=True)
+        if not stdout:
+            # print("Did not find stdout on first exit code verification")
+            await asyncio.sleep(10)
+            rc, stdout, stderr = await read_and_display_async(*cmd, hide_display=True)
+
+        # job is still pending/working
+        if re.match(r"error: job id .* not found", stderr):
+            return False
+
+        if not stdout:
+            print("Still did not find stdout - error")
+            return "ERRORED"
+
+        # Read the qacct stdout into dictionary stdout_dict
+        for line in stdout.splitlines():
+            line_split = line.split()
+            # print(f"line_split: {line_split}")
+            if len(line_split) > 1:
+                if line_split[0] == "failed":
+                    if line_split[1].isdigit() and int(line_split[1]) == 100:
+                        print(f"failed for {jobid} is `{int(line_split[1])}`")
+                        return "ERRORED"
+
         return True
 
 
