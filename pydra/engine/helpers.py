@@ -515,6 +515,7 @@ async def read_and_display_async(*cmd, hide_display=False, strip=False):
     Works line-by-line.
 
     """
+    print(cmd)
     # start process
     process = await asyncio.create_subprocess_exec(
         *cmd, stdout=asp.PIPE, stderr=asp.PIPE
