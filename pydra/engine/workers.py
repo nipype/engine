@@ -375,6 +375,7 @@ class SGEWorker(DistributedWorker):
         polls_before_checking_evicted=60,
         collect_jobs_delay=30,
         default_qsub_args="",
+        max_mem_free=None,
     ):
         """
         Initialize SGE Worker.
@@ -431,6 +432,7 @@ class SGEWorker(DistributedWorker):
         self.collect_jobs_delay = collect_jobs_delay
         self.task_pkls_rerun = {}
         self.default_qsub_args = default_qsub_args
+        self.max_mem_free = max_mem_free
 
     def run_el(self, runnable, rerun=False):
         """Worker submission API."""
@@ -439,7 +441,6 @@ class SGEWorker(DistributedWorker):
             batch_script,
             task_pkl,
             ind,
-            threads_requested,
             output_dir,
             task_qsub_args,
         ) = self._prepare_runscripts(runnable, rerun=rerun)
@@ -461,7 +462,6 @@ class SGEWorker(DistributedWorker):
             cache_dir=cache_dir,
             task_pkl=task_pkl,
             ind=ind,
-            threads_requested=threads_requested,
             output_dir=output_dir,
             task_qsub_args=task_qsub_args,
         )
@@ -481,7 +481,7 @@ class SGEWorker(DistributedWorker):
             cache_dir = task[-1].cache_dir
             uid = f"{task[-1].uid}_{ind}"
             try:
-                print(f"task[-1].qsub_args: {task[-1].qsub_args}")
+                # print(f"task[-1].qsub_args: {task[-1].qsub_args}")
                 task_qsub_args = task[-1].qsub_args
             except:
                 task_qsub_args = self.default_qsub_args
@@ -523,15 +523,6 @@ class SGEWorker(DistributedWorker):
         # if not isinstance(threads_requested, int):
         #     threads_requested = self.default_threads_per_task
 
-        # Get the number of slots requested for this task
-        if "smp" in task_qsub_args:
-            smp_index = task_qsub_args.split().index("smp")
-            if (
-                smp_index + 1 < len(task_qsub_args.split())
-                and task_qsub_args.split()[smp_index + 1].isdigit()
-            ):
-                threads_requested = int(task_qsub_args.split()[smp_index + 1])
-
         if task_qsub_args not in self.tasks_to_run_by_threads_requested:
             self.tasks_to_run_by_threads_requested[task_qsub_args] = []
         self.tasks_to_run_by_threads_requested[task_qsub_args].append(
@@ -543,20 +534,25 @@ class SGEWorker(DistributedWorker):
             batchscript,
             task_pkl,
             ind,
-            threads_requested,
             task.output_dir,
             task_qsub_args,
         )
 
-    async def get_tasks_to_run(self, task_qsub_args):
+    async def get_tasks_to_run(self, task_qsub_args, mem_free):
         # Extract the first N tasks to run
-        print(f"task_qsub_args: {task_qsub_args}")
+        # print(f"task_qsub_args: {task_qsub_args}")
+        if mem_free is not None and self.max_mem_free is not None:
+            max_job_array_length = min(
+                self.max_job_array_length, int(self.max_mem_free / mem_free)
+            )
+        else:
+            max_job_array_length = self.max_job_array_length
         tasks_to_run_copy, self.tasks_to_run_by_threads_requested[task_qsub_args] = (
             self.tasks_to_run_by_threads_requested[task_qsub_args][
-                : self.max_job_array_length
+                :max_job_array_length
             ],
             self.tasks_to_run_by_threads_requested[task_qsub_args][
-                self.max_job_array_length :
+                max_job_array_length:
             ],
         )
         return tasks_to_run_copy
@@ -573,17 +569,40 @@ class SGEWorker(DistributedWorker):
         name,
         uid,
         cache_dir,
-        threads_requested,
         output_dir,
         task_qsub_args,
         interpreter="/bin/sh",
     ):
+        # Get the number of slots requested for this task
+        threads_requested = self.default_threads_per_task
+        if "smp" in task_qsub_args:
+            smp_index = task_qsub_args.split().index("smp")
+            if (
+                smp_index + 1 < len(task_qsub_args.split())
+                and task_qsub_args.split()[smp_index + 1].isdigit()
+            ):
+                threads_requested = int(task_qsub_args.split()[smp_index + 1])
+        # Get the amount of mem_free requested for the job
+        mem_free = None
+        if "mem_free" in task_qsub_args:
+            mem_free_cmd = [
+                word for word in task_qsub_args.split() if word.startswith("mem_free")
+            ][0]
+            if len(re.findall(r"\d+", mem_free_cmd)) > 0:
+                mem_free = int(re.findall(r"\d+", mem_free_cmd)[0])
+
         if (
             len(self.tasks_to_run_by_threads_requested.get(task_qsub_args))
             <= self.max_job_array_length
         ):
             await asyncio.sleep(self.collect_jobs_delay)
-        tasks_to_run = await self.get_tasks_to_run(task_qsub_args)
+        tasks_to_run = await self.get_tasks_to_run(task_qsub_args, mem_free)
+
+        if mem_free is not None:
+            summed_mem_free_cmd = re.sub(
+                str(mem_free), str(len(tasks_to_run) * mem_free), mem_free_cmd
+            )
+            task_qsub_args = re.sub(mem_free_cmd, summed_mem_free_cmd, task_qsub_args)
 
         if len(tasks_to_run) > 0:
             if self.max_threads is not None:
@@ -742,7 +761,7 @@ class SGEWorker(DistributedWorker):
                 if info_file.exists():
                     checksum = json.loads(info_file.read_text())["checksum"]
                     if (cache_dir / f"{checksum}.lock").exists():
-                        print(f'Unlinking lock file {cache_dir / f"{checksum}.lock"}')
+                        # print(f'Unlinking lock file {cache_dir / f"{checksum}.lock"}')
                         # for pyt3.8 we could use missing_ok=True
                         (cache_dir / f"{checksum}.lock").unlink()
                     # Maybe wait a little to check if _error.pklz exists - not getting found immediately
@@ -836,7 +855,6 @@ class SGEWorker(DistributedWorker):
         cache_dir,
         task_pkl,
         ind,
-        threads_requested,
         output_dir,
         task_qsub_args,
     ):
@@ -846,7 +864,6 @@ class SGEWorker(DistributedWorker):
             name,
             uid,
             cache_dir,
-            threads_requested,
             output_dir,
             task_qsub_args,
         )
@@ -855,11 +872,11 @@ class SGEWorker(DistributedWorker):
         if self.poll_for_result_file:
             while True:
                 result_file = output_dir / "_result.pklz"
-                error_file = output_dir / "_error.pklz"
+                # error_file = output_dir / "_error.pklz"
                 if result_file.exists() and str(task_pkl) not in self.task_pkls_rerun:
-                    task = load_task(task_pkl=task_pkl, ind=ind)
+                    # task = load_task(task_pkl=task_pkl, ind=ind)
                     print(f"Returning true for {task_pkl}")
-                    print(f"task not errored")
+                    # print(f"task not errored")
                     return True
                 await asyncio.sleep(self.poll_delay)
         else:
